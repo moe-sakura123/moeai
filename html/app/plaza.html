@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>创意广场 · 蜜丝AI</title>
+  <link rel="stylesheet" href="/app/css/app.css">
+  <script src="/app/js/core/guard.js"></script>
+  <script src="/app/js/core/api.js"></script>
+  <script src="/app/js/core/store.js"></script>
+  <script src="/app/js/core/ui.js"></script>
+</head>
+<body>
+<div id="topbar"></div>
+
+<div class="page-wrap">
+  <div class="page-head">
+    <div>
+      <h1>创意广场</h1>
+      <p>写作风格 / 破甲词 / 界面换肤，挑一个装进你的角色会话</p>
+    </div>
+    <div class="row">
+      <input class="input" id="kw" placeholder="搜索标题、简介、作者" style="width:220px">
+      <select class="select" id="sort" style="width:118px">
+        <option value="latest">最新</option>
+        <option value="sales">销量</option>
+        <option value="rating">好评</option>
+        <option value="heat">热度</option>
+      </select>
+      <button class="btn primary" id="btn-search">搜索</button>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-bottom:14px">
+    <div class="panel-body tight row between">
+      <div class="tabs" id="zones">
+        <button class="active" data-type="">全部</button>
+        <button data-type="break_armor">破甲词</button>
+        <button data-type="speaking_style">写作风格</button>
+        <button data-type="ui_theme">界面换肤</button>
+        <button data-type="skin_css">皮肤 CSS</button>
+      </div>
+      <span class="tiny muted" id="count">—</span>
+    </div>
+  </div>
+
+  <div id="grid" class="card-grid"></div>
+
+  <div class="row" style="justify-content:center;margin-top:16px">
+    <button class="btn" id="btn-more" hidden>加载更多</button>
+  </div>
+</div>
+
+<script src="/app/js/pages/plaza.js"></script>
+</body>
+</html>

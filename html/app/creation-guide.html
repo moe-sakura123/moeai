@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>HTML / CSS 教程 · 蜜丝AI</title>
+  <link rel="stylesheet" href="/app/css/app.css">
+  <link rel="stylesheet" href="/app/css/guide.css">
+  <script src="/app/js/core/guard.js"></script>
+  <script src="/app/js/core/api.js"></script>
+  <script src="/app/js/core/store.js"></script>
+  <script src="/app/js/core/ui.js"></script>
+</head>
+<body>
+<div id="topbar"></div>
+
+<div class="page-wrap">
+  <div class="guide-hero">
+    <div class="grow">
+      <span class="badge ok">本地版 · 无需联网</span>
+      <h1>LLM 回复 HTML 和自定义 CSS 样式指南</h1>
+      <p>让角色卡的详情简述、开场白、聊天回复用上排版、状态栏、立绘和纯 CSS 交互。本页所有示例都能在浏览器里直接试，不依赖任何线上资源。</p>
+      <div class="row" style="margin-top:10px">
+        <a class="chip" href="#start">零基础 5 分钟</a>
+        <a class="chip" href="#templates">模板库</a>
+        <a class="chip" href="#rules">规则与限制</a>
+        <a class="chip" href="#faq">常见问题</a>
+      </div>
+    </div>
+    <div class="row">
+      <a class="btn sm" href="/app/creation">回创作页</a>
+    </div>
+  </div>
+
+  <div class="split guide-split">
+    <aside class="panel guide-toc">
+      <a href="#start">零基础 · 5 分钟</a>
+      <a href="#lab">实时试验台</a>
+      <a href="#templates">模板库</a>
+      <a href="#tags">自定义标签</a>
+      <a href="#rules">CSS 规则与限制</a>
+      <a href="#animation">动画</a>
+      <a href="#components">内置交互组件</a>
+      <a href="#tagref">HTML 标签参考</a>
+      <a href="#misc">其他约定</a>
+      <a href="#faq">常见问题</a>
+      <a href="#cheatsheet">一页速查</a>
+    </aside>
+
+    <main class="stack">
+
+      <!-- ---------------------------------------------------- 零基础 -->
+      <section class="panel guide-sec" id="start">
+        <div class="panel-head"><b>零基础 · 5 分钟</b><span class="tiny muted">新手从这里开始</span></div>
+        <div class="panel-body">
+          <p>我是新手：本节 → <a class="link" href="#templates">模板库</a>挑一个抄 → 回创作页粘贴。我懂 HTML/CSS：直接看 <a class="link" href="#rules">规则与限制</a>。</p>
+
+          <h3>三十秒搞懂：HTML 和 CSS 各干什么</h3>
+          <p>把一条 AI 回复想成一个人：<b>HTML 是骨架和内容</b>（这段话是什么、分几块），<b>CSS 是衣服和妆容</b>（什么颜色、多大、怎么排）。HTML 用<b>标签</b>（尖括号包起来的名字，如 <code>&lt;status&gt;</code>）圈住内容；CSS 用<b>选择器</b>（告诉样式“给谁”的写法）点名要打扮谁。</p>
+          <div class="lab" style="grid-template-columns:1fr 1fr;margin:12px 0">
+            <div>
+              <div class="tiny muted" style="margin-bottom:6px">没有 CSS</div>
+              <div style="padding:12px;border:1px solid var(--line-2);border-radius:10px;background:#111119;color:#ddd">
+                体力：72/100<br>精神：轻度疲惫
+              </div>
+            </div>
+            <div>
+              <div class="tiny muted" style="margin-bottom:6px">加上 CSS</div>
+              <div style="padding:12px;border:1px solid var(--line-2);border-radius:10px;background:#111119">
+                <div style="padding:6px 10px;margin-bottom:6px;border-left:3px solid #d4af37;background:rgba(212,175,55,.08);color:#f0d98a;border-radius:0 6px 6px 0;font-weight:600">体力：72/100</div>
+                <div style="padding:6px 10px;border-left:3px solid #7c9cff;background:rgba(124,156,255,.08);color:#c3d0ff;border-radius:0 6px 6px 0;font-weight:600">精神：轻度疲惫</div>
+              </div>
+            </div>
+          </div>
+
+          <h3><span class="anchor-num">1</span>第一步：在哪里写（先对号入座）</h3>
+          <table class="guide-table">
+            <thead><tr><th>场景</th><th>HTML 写在哪</th><th>CSS 写在哪</th><th>特别注意</th></tr></thead>
+            <tbody>
+              <tr><td>角色卡</td><td>创作页「角色描述 / 详情描述」</td><td>详情描述里直接写 <code>&lt;style&gt;</code></td><td>无长度硬限；<b>开场白限制更严</b></td></tr>
+              <tr><td>广场「回复样式」商品</td><td>发布页「提示词内容」</td><td>发布页「配套 CSS」</td><td>CSS ≤ <b>10000 字符</b>，超出保存被拒</td></tr>
+              <tr><td>聊天消息正文</td><td>正文里直接写 <code>&lt;style&gt;</code></td><td>同一个地方</td><td>外链 <code>url()</code> 会被处理，只认 data: 内联图</td></tr>
+            </tbody>
+          </table>
+
+          <h3><span class="anchor-num">2</span>第二步：Hello World（30 秒第一次成功）</h3>
+          <p>到下面的 <a class="link" href="#lab">实时试验台</a>，左边代码直接改（比如把背景色 <code>#d4af37</code> 换成 <code>#4a90d9</code>），右边立刻变。每个模板都在注释里标了哪些行是可改参数。</p>
+
+          <details class="guide-details">
+            <summary>CSS 迷你课：盒模型与十个最常用属性</summary>
+            <div style="display:flex;flex-direction:column;gap:6px;margin:8px 0 12px">
+              <div style="padding:10px;border:1px dashed rgba(168,85,247,.5);border-radius:8px;background:rgba(168,85,247,.06);font-size:12px;color:var(--muted)">
+                margin 外边距（和别人的距离）
+                <div style="margin-top:6px;padding:8px;border:1px solid rgba(251,191,36,.5);border-radius:6px;background:rgba(251,191,36,.06);color:#f0d98a">
+                  border 边框
+                  <div style="margin-top:6px;padding:8px;border:1px solid rgba(52,211,153,.5);border-radius:6px;background:rgba(52,211,153,.06);color:#a7f3d0">
+                    padding 内边距（和文字的距离）
+                    <div style="margin-top:6px;padding:8px;border:1px dashed rgba(255,255,255,.3);border-radius:4px;color:#ddd">content 内容（你的文字 / 图片）</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <p>写 CSS 就是在告诉浏览器：这几层各自的厚度、颜色、形状。下面是覆盖 90% 场景的十个属性。</p>
+            <table class="guide-table">
+              <thead><tr><th>属性</th><th>干什么</th><th>示例值（直接抄改）</th></tr></thead>
+              <tbody>
+                <tr><td><code>color</code></td><td>文字颜色</td><td><code>#d4af37</code></td></tr>
+                <tr><td><code>font-size</code></td><td>字号</td><td><code>16px</code></td></tr>
+                <tr><td><code>font-weight</code></td><td>加粗程度</td><td><code>700</code>（正常 400）</td></tr>
+                <tr><td><code>background</code></td><td>背景（色或图）</td><td><code>#1a1510</code> / <code>url("…")</code></td></tr>
+                <tr><td><code>padding</code></td><td>内边距</td><td><code>8px 12px</code>（上下 左右）</td></tr>
+                <tr><td><code>margin</code></td><td>外边距</td><td><code>10px auto</code>（auto = 水平居中）</td></tr>
+                <tr><td><code>border</code></td><td>边框</td><td><code>1px solid #b8860b</code></td></tr>
+                <tr><td><code>border-radius</code></td><td>圆角</td><td><code>6px</code>，全圆用 <code>999px</code></td></tr>
+                <tr><td><code>display</code></td><td>显示方式</td><td><code>block</code> 独占一行 / <code>inline-block</code> 行内块</td></tr>
+                <tr><td><code>width / height</code></td><td>宽 / 高</td><td><code>200px</code> / <code>100%</code></td></tr>
+              </tbody>
+            </table>
+          </details>
+
+          <h3><span class="anchor-num">3</span>第三步：没生效？先查这三点</h3>
+          <table class="guide-table">
+            <thead><tr><th>症状</th><th>原因</th><th>解法</th></tr></thead>
+            <tbody>
+              <tr><td><code>&lt;status&gt;</code> 显示成字面文字</td><td>标签的 <code>&lt;</code> 前紧贴了字母/数字（如 <code>n&lt;status</code>），被当成比较符号</td><td>标签前后留空格或换行</td></tr>
+              <tr><td>样式完全不生效</td><td>选择器没以 <code>.markdown-body</code> 开头</td><td>所有选择器都以 <code>.markdown-body</code> 开头（黄金规则）</td></tr>
+              <tr><td>颜色被系统改了</td><td>只写了 color 没写 background</td><td>color 和 background 成对写（对比度 ≥ 4.5:1）</td></tr>
+            </tbody>
+          </table>
+
+          <div class="callout warn">
+            <b>开场白比详情描述严格</b><br>
+            开场白（首条消息）会进弹窗和聊天气泡，<b>不允许</b> <code>&lt;script&gt;</code>、<code>&lt;iframe&gt;</code>、<code>&lt;svg&gt;</code> 等可执行 / 嵌入标签和 <code>on*</code> 事件属性，保存会被直接拦截。详情描述则允许完整 HTML 应用。做卡时请把复杂排版放在详情描述里。
+          </div>
+
+          <div class="callout ok"><b>5 分钟路径</b><br>
+            本节 → <a class="link" href="#templates">模板库</a>挑一个抄 → 回创作页粘贴 → 保存看预览。遇到问题查 <a class="link" href="#faq">常见问题</a>。
+          </div>
+        </div>
+      </section>
+
+      <!-- ---------------------------------------------------- 试验台 -->
+      <section class="panel guide-sec" id="lab">
+        <div class="panel-head"><b>实时试验台</b><span class="tiny muted">左边改代码，右边实时预览</span></div>
+        <div class="panel-body">
+          <div class="lab-bar" style="margin-bottom:10px" id="lab-chips"></div>
+          <div class="lab">
+            <div class="lab-side">
+              <div class="lab-tabs" id="lab-tabs">
+                <button type="button" data-pane="html" class="on">HTML</button>
+                <button type="button" data-pane="css">CSS</button>
+              </div>
+              <textarea class="code-area" id="lab-html" spellcheck="false" placeholder="在这里写 HTML"></textarea>
+              <textarea class="code-area" id="lab-css" spellcheck="false" placeholder="在这里写 CSS（选择器记得以 .markdown-body 开头）" hidden></textarea>
+              <div class="row">
+                <button class="btn sm primary" id="lab-copy">复制 HTML</button>
+                <button class="btn sm" id="lab-copy-css">复制 CSS</button>
+                <button class="btn sm ghost" id="lab-reset">重置</button>
+                <span class="tiny muted">预览只在本页生效，不会改你的作品</span>
+              </div>
+            </div>
+            <div>
+              <iframe class="lab-preview" id="lab-preview" title="实时预览" sandbox="allow-scripts"></iframe>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ---------------------------------------------------- 模板库 -->
+      <section class="panel guide-sec" id="templates">
+        <div class="panel-head"><b>抄改用模板库</b><span class="tiny muted">点「载入试验台」直接改</span></div>
+        <div class="panel-body">
+          <p>每个模板都能直接编辑试效果：点「复制」拿到完整代码，HTML 贴进对应字段、CSS 贴进 <code>&lt;style&gt;</code> 或配套 CSS。<b>注释里标了哪些行是可改参数</b>。难度：入门 = 一两行属性；进阶 = 组合属性；高级 = 定位 / 动画 / 交互。</p>
+          <div class="tpl-grid" id="tpl-grid"></div>
+          <div class="callout warn" style="margin-top:14px"><b>提示</b><br>本页预览是本地近似渲染（自动给自定义标签加 <code>tag-名字</code> 类、内联场景自动用行内显示）。线上渲染器还会做标签归一（<code>top_status → top-status</code>）和隐藏声明安全网，以最终聊天里的效果为准。</div>
+        </div>
+      </section>
+
+      <!-- ---------------------------------------------------- 自定义标签 -->
+      <section class="panel guide-sec" id="tags">
+        <div class="panel-head"><b>自定义标签</b><span class="tiny muted">面板 / 状态栏 / 信息块</span></div>
+        <div class="panel-body">
+          <p>角色卡做“面板 / 状态栏 / 信息块”靠它。命名规则：</p>
+          <ul>
+            <li><b>命名</b>：字母开头，可用字母 / 数字 / 连字符。</li>
+            <li><b>下划线自动转连字符</b>：写 <code>&lt;top_status&gt;</code> 会渲染成 <code>&lt;top-status&gt;</code>，CSS 选择器同步归一，无需手动改。</li>
+            <li><b>大小写不敏感</b>：<code>&lt;T&gt;</code> 与 <code>&lt;t&gt;</code> 都是 <code>.tag-t</code>。</li>
+          </ul>
+          <p>三种等价 CSS 写法（任选其一）：</p>
+          <pre class="code-area" style="height:auto;min-height:0" readonly>/* ① 推荐：标签名选择器，系统自动改写 */
+.markdown-body faction_panel { background: #2b1d15; }
+/* ② 直接用类名 */
+.markdown-body .tag-faction-panel { background: #2b1d15; }
+/* ③ 用 data 属性 */
+.markdown-body [data-tag="faction-panel"] { background: #2b1d15; }</pre>
+          <div class="guide-details">
+            <summary>什么时候是 span 而不是 div</summary>
+            <p>当标签<b>在 <code>&lt;p&gt;</code> 内</b>（任意层祖先）或<b>直接父级是 <code>&lt;span&gt;</code></b> 时，会渲染成内联的 <code>&lt;span&gt;</code>（同样带 <code>tag-名字</code> 类），避免非法嵌套。</p>
+          </div>
+          <div class="callout bad"><b>别用原生标签名当自定义标签</b><br>
+            <code>&lt;s&gt;</code> 是删除线、<code>&lt;b&gt;</code> 是加粗、<code>&lt;i&gt;</code> 是斜体，按原生语义渲染，<b>不会</b>变成 <code>.tag-s</code>。自定义请用不在白名单里的名字，如 <code>&lt;stat&gt;</code>、<code>&lt;panel&gt;</code>、<code>&lt;tip&gt;</code>。
+          </div>
+        </div>
+      </section>
+
+      <!-- ---------------------------------------------------- 规则 -->
+      <section class="panel guide-sec" id="rules">
+        <div class="panel-head"><b>CSS 规则与限制</b><span class="tiny muted">踩坑最多的一节</span></div>
+        <div class="panel-body">
+          <h3>作用域：选择器以 .markdown-body 开头</h3>
+          <p>正文渲染在一个专属容器里，作者用 <code>.markdown-body</code> 这个别名来定位它。你写的 CSS 只影响<b>这张卡的内容</b>，系统自动给选择器加容器前缀。</p>
+          <pre class="code-area" style="height:auto;min-height:0" readonly>/* 推荐：SillyTavern 通用写法，本站完全支持 */
+.markdown-body .panel { background: #1a1a1a; }
+.markdown-body faction_panel { color: #fff; } /* 自定义标签也这么写 */</pre>
+
+          <h3>沙箱：z-index 与定位</h3>
+          <ul>
+            <li><code>z-index</code> 被限制在 <b>[-100, 100]</b>，叠层用 1~99 即可。</li>
+            <li>容器开了 <code>contain</code>，<code>position: fixed</code> 也<b>只在本条消息范围内</b>，逃不出去。</li>
+          </ul>
+
+          <h3>隐藏声明的安全网</h3>
+          <p>想做“默认隐藏、交互时显示”（tooltip / 折叠详情），必须<b>成对</b>写：一条隐藏 + 一条带 <code>:hover</code> / <code>:focus</code> / <code>:checked</code> / <code>[open]</code> 等交互状态的显示规则。否则系统认为你在误藏内容，会剥掉隐藏、强制显示。</p>
+          <table class="guide-table">
+            <thead><tr><th>你的写法</th><th>结果</th></tr></thead>
+            <tbody>
+              <tr><td><code>.markdown-body cot { display:none }</code></td><td>独立壳被藏 → 剥隐藏，强制可见</td></tr>
+              <tr><td><code>.markdown-body panel .secret { display:none }</code></td><td>无配套显示 → 剥隐藏，强制可见</td></tr>
+              <tr><td>上方 + <code>panel:hover .secret { display:block }</code></td><td>有配套显示 → 保留隐藏，hover 显示</td></tr>
+            </tbody>
+          </table>
+          <div class="guide-details">
+            <summary>关于 !important</summary>
+            <p>合法交互模式下隐藏声明原样保留（含 <code>!important</code>）。显示规则要赢也必须加 <code>!important</code>。但在<b>没有</b>配套显示时，<code>!important</code> 也保不住隐藏。</p>
+          </div>
+
+          <h3>颜色自适应</h3>
+          <ul>
+            <li><b>暗色主题</b>：无背景的深色文字自动提亮。想锁死，给元素同时设 <code>color</code> 和 <code>background</code>。</li>
+            <li><b>对比度守卫</b>：前景背景太接近时文字色自动改成可读色。</li>
+            <li><b>阅读模式</b>：强制统一可读前景 / 背景。</li>
+          </ul>
+          <p class="small muted">系统内置的基础样式优先级很低，你写的 CSS 默认就能覆盖它，不需要为此外加 <code>!important</code>。</p>
+
+          <h3>危险 CSS 清洗与硬性限制</h3>
+          <table class="guide-table">
+            <thead><tr><th>写法</th><th>角色卡 CSS</th><th>消息正文 &lt;style&gt;</th></tr></thead>
+            <tbody>
+              <tr><td><code>url("https://…")</code> 外链图片</td><td>保留（立绘 / 背景图推荐用法）</td><td>剥离，只允许 data: 内联图</td></tr>
+              <tr><td><code>@import</code></td><td>一律别用（渲染时全部移除）</td><td>剥离</td></tr>
+              <tr><td><code>@keyframes</code> / <code>@media</code></td><td>支持</td><td>支持</td></tr>
+              <tr><td><code>&lt;script&gt;</code> / <code>expression()</code> / <code>javascript:</code></td><td>保存被拒</td><td>剥离</td></tr>
+              <tr><td><code>html</code> 选择器</td><td>保存被拒（body 已放开）</td><td>剥离</td></tr>
+            </tbody>
+          </table>
+          <div class="callout warn"><b>为什么 @import 引字体不行</b><br>
+            后端虽然放行字体 CDN 白名单（能保存成功），但<b>网页端渲染时会移除所有 @import</b> ——结果就是“保存成功却永远不生效”。自定义字体目前没有官方通道，请用系统字体栈：<code>font-family: "Kaiti", "STKaiti", serif;</code>
+          </div>
+
+          <h3>长度限制（超限保存被拒）</h3>
+          <table class="guide-table">
+            <thead><tr><th>字段</th><th>上限</th></tr></thead>
+            <tbody>
+              <tr><td>广场「配套 CSS」</td><td><b>10000 字符</b></td></tr>
+              <tr><td>角色卡「自定义 CSS / 详情描述」</td><td>无硬性上限（建议控制在几十 KB 内）</td></tr>
+              <tr><td>提示词类字段</td><td>破甲词 / 世界观 ≤ 15000；主提示词 ≤ 32000</td></tr>
+              <tr><td>广场其它</td><td>标题 ≤ 200；简介 ≤ 2000；提示词内容 ≤ 20000</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ---------------------------------------------------- 动画 -->
+      <section class="panel guide-sec" id="animation">
+        <div class="panel-head"><b>动画</b><span class="tiny muted">@keyframes 开箱即用</span></div>
+        <div class="panel-body">
+          <p>作用域系统对 <code>@keyframes</code> 原样保留、对 <code>@media</code> 内部规则自动加前缀，所以<b>纯 CSS 动画开箱即用</b>：呼吸灯、充能条、入场淡入都能做，且不受 z-index / 定位沙箱影响。</p>
+          <p>示例见模板库的「呼吸灯 · 在线状态」。注意：每条消息都会重新播放动画，呼吸灯这类<b>循环动画</b>建议只用在状态指示上；入场动画 0.3~0.8 秒为宜，并加 <code>prefers-reduced-motion</code> 关照敏感用户。</p>
+          <div class="row">
+            <button class="chip" data-load-tpl="online">载入呼吸灯示例</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ---------------------------------------------------- 内置组件 -->
+      <section class="panel guide-sec" id="components">
+        <div class="panel-head"><b>内置交互组件</b><span class="tiny muted">系统自带，不用写 JS</span></div>
+        <div class="panel-body">
+          <h3>1. 点击揭示（click-to-reveal）</h3>
+          <pre class="code-area" style="height:auto;min-height:0" readonly>&lt;span class="observe-wrap-v2"&gt;
+  &lt;span class="secret-trigger-v2"&gt;🔮 点击查看密信&lt;/span&gt;
+  &lt;span class="secret-popup-v2"&gt;这是一段隐藏的剧情…&lt;/span&gt;
+&lt;/span&gt;</pre>
+
+          <h3>2. 纯 CSS 手风琴 / Tab</h3>
+          <p>写 <code>&lt;label for="x"&gt;</code>，系统自动补缺失的 <code>&lt;input type="checkbox"&gt;</code>：</p>
+          <pre class="code-area" style="height:auto;min-height:0" readonly>&lt;label for="t1"&gt;展开第一章&lt;/label&gt;
+&lt;div class="ch1"&gt;第一章内容…&lt;/div&gt;</pre>
+          <p class="small muted">单选框 Tab 要自己写 <code>&lt;input type="radio" name="tabs"&gt;</code>，自动注入的永远是 checkbox。</p>
+
+          <h3>3. &lt;details&gt; 折叠 + 围栏</h3>
+          <ul>
+            <li>嵌套 <code>&lt;details&gt;</code> 会被<b>拍平成兄弟</b>（不能靠嵌套做层级）。</li>
+            <li>代码围栏会变成一个带样式的布局区块，<b>里面的 Markdown 会继续渲染</b>（不是灰色代码框）。</li>
+          </ul>
+          <div class="row">
+            <button class="chip" data-load-tpl="reveal">载入点击揭示示例</button>
+            <button class="chip" data-load-tpl="accordion">载入手风琴示例</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ---------------------------------------------------- 标签参考 -->
+      <section class="panel guide-sec" id="tagref">
+        <div class="panel-head"><b>HTML 标签参考</b><span class="tiny muted">白名单节选</span></div>
+        <div class="panel-body">
+          <p>标准 HTML 标签按原生渲染。常用白名单：</p>
+          <pre class="code-area" style="height:auto;min-height:0" readonly>a b i em strong p span div section
+h1-h6 ul ol li details summary
+table thead tbody td th
+img pre code blockquote q
+label input button select textarea
+br hr mark small sub sup …</pre>
+          <table class="guide-table">
+            <thead><tr><th>标签</th><th>行为</th></tr></thead>
+            <tbody>
+              <tr><td><code>details</code></td><td>原生折叠。会被拍平 / 补空行</td></tr>
+              <tr><td><code>table / thead / th</code></td><td>表头自动套渐变色（改色用 !important）</td></tr>
+              <tr><td><code>style</code></td><td>仅写在消息正文里时保留并隔离，清洗危险 CSS</td></tr>
+              <tr><td><code>img</code></td><td>默认 max-width:100% + 圆角</td></tr>
+              <tr><td><code>script iframe link meta object …</code></td><td>强制剥壳：功能性移除，文字仍可见</td></tr>
+              <tr><td><code>think / text / ai-summary / next-prompt</code></td><td>系统专用，会被移除，别当普通标签</td></tr>
+            </tbody>
+          </table>
+          <div class="callout bad"><b>交互不能用 onclick</b><br>
+            <code>on*</code> 事件、<code>contenteditable</code>、<code>ref</code> 会被删除。交互只能用纯 CSS（<code>:hover</code> / <code>:checked</code> / <code>[open]</code> / <code>&lt;details&gt;</code>）或内置组件。<code>data-*</code> / <code>aria-*</code> 属性会保留，可作选择器钩子。
+          </div>
+        </div>
+      </section>
+
+      <!-- ---------------------------------------------------- 其他约定 -->
+      <section class="panel guide-sec" id="misc">
+        <div class="panel-head"><b>其他约定</b><span class="tiny muted">小细节</span></div>
+        <div class="panel-body">
+          <table class="guide-table">
+            <thead><tr><th>项</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><b>图片</b></td><td>默认 max-width:100% + 圆角；<b>别用 <code>cg-inline-image</code> 类</b>（站内 CG 保留类）</td></tr>
+              <tr><td><b>CSS 变量</b></td><td>可在 <code>.markdown-body</code> 上定义自己的变量（如 <code>--my-color</code>），子元素直接复用</td></tr>
+              <tr><td><b>iOS 限制</b></td><td>无删除线简写（用 <code>&lt;s&gt;</code>）、无任务列表（用 checkbox）、无裸链接自动识别（用 <code>&lt;a&gt;</code>）</td></tr>
+              <tr><td><b>流式输出</b></td><td>AI 边生成边显示，未闭合标签会被临时处理；<b>以生成完成后的样子为准</b></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ---------------------------------------------------- FAQ -->
+      <section class="panel guide-sec" id="faq">
+        <div class="panel-head"><b>常见问题</b><span class="tiny muted">点开看答案</span></div>
+        <div class="panel-body">
+          <details class="guide-details"><summary>Q：我写的 sprite.char-xxx 没生效？</summary>
+            <p>系统把 <code>&lt;sprite&gt;</code> 转成 <code>&lt;div class="char-xxx tag-sprite"&gt;</code>，CSS 里 <code>sprite</code> 自动改写为 <code>.tag-sprite</code>。<code>.markdown-body sprite.char-xxx { }</code> 能命中。空标签记得给 width / height。</p>
+          </details>
+          <details class="guide-details"><summary>Q：&lt;top_status&gt; 显示成字面文字了？</summary>
+            <p>通常是标签 <code>&lt;</code> 前紧贴了字母 / 数字 / 下划线（如 <code>n&lt;top_status&gt;</code>），被当比较运算符而没归一。给标签前后留空格 / 换行即可。</p>
+          </details>
+          <details class="guide-details"><summary>Q：details / tooltip 默认就展开了？</summary>
+            <p>要做“默认隐藏 + 交互显示”，必须配套写带 <code>:hover</code> / <code>:focus</code> / <code>:checked</code> / <code>[open]</code> 的显示规则。只写隐藏会被安全网强制改成可见。</p>
+          </details>
+          <details class="guide-details"><summary>Q：颜色 / 背景被改了？</summary>
+            <p>暗色模式自动提亮、对比度守卫、或阅读模式在起作用。给元素同时设 <code>color</code> + <code>background</code> 可减少被改。</p>
+          </details>
+          <details class="guide-details"><summary>Q：@import 引入字体怎么不行？</summary>
+            <p>网页端渲染器会移除所有 <code>@import</code>，所以永远不生效。请用系统字体栈，如 <code>font-family: "Kaiti", "STKaiti", serif;</code>。</p>
+          </details>
+          <details class="guide-details"><summary>Q：开场白里的 HTML 保存被拦？</summary>
+            <p>开场白限制比详情描述严格：不允许 script / iframe / svg 等标签和 <code>on*</code> 事件属性。把复杂排版放到详情描述里。</p>
+          </details>
+          <details class="guide-details"><summary>Q：能用 &lt;script onclick&gt; 做交互吗？</summary>
+            <p>不能。<code>&lt;script&gt;</code> 剥壳、<code>on*</code> 属性被删。交互用纯 CSS 或内置组件。</p>
+          </details>
+          <details class="guide-details"><summary>Q：本页预览和聊天里的效果一样吗？</summary>
+            <p>大体一致，但本页是本地近似渲染。线上渲染器还会做标签归一（<code>top_status → top-status</code>）、隐藏声明安全网、颜色自适应等处理。以最终聊天里的效果为准。</p>
+          </details>
+        </div>
+      </section>
+
+      <!-- ---------------------------------------------------- 速查 -->
+      <section class="panel guide-sec" id="cheatsheet">
+        <div class="panel-head"><b>一页速查 + 术语表</b><span class="tiny muted">收藏这一段就够了</span></div>
+        <div class="panel-body">
+          <div class="cheat-grid">
+            <div class="cheat"><b>容器定位</b><span>所有选择器以 .markdown-body 开头</span></div>
+            <div class="cheat"><b>自定义标签</b><span>→ div/span.tag-名字（下划线自动转连字符）</span></div>
+            <div class="cheat"><b>别用原生名</b><span>&lt;s&gt;/&lt;b&gt;/&lt;i&gt; 按原生渲染，不会变 .tag-*</span></div>
+            <div class="cheat"><b>沙箱</b><span>z-index ∈ [-100,100]；position:fixed 关在气泡内</span></div>
+            <div class="cheat"><b>隐藏内容</b><span>必须配套交互显示规则，否则强制可见</span></div>
+            <div class="cheat"><b>颜色</b><span>建议同时给 color + background；基础样式你天然赢</span></div>
+            <div class="cheat"><b>内置交互</b><span>点击揭示 / label+input 手风琴 / details</span></div>
+            <div class="cheat"><b>代码围栏</b><span>围栏 = 布局区块，内部 Markdown 会渲染</span></div>
+            <div class="cheat"><b>外链 url()</b><span>仅角色卡 CSS 可用；正文 &lt;style&gt; 里被剥</span></div>
+            <div class="cheat"><b>@import</b><span>一律别用（渲染时全部移除）；字体用系统字体栈</span></div>
+            <div class="cheat"><b>动画</b><span>@keyframes / @media 都支持</span></div>
+            <div class="cheat"><b>长度</b><span>广场配套 CSS ≤ 10000 字符；角色卡无硬限</span></div>
+            <div class="cheat"><b>开场白</b><span>比详情描述严：禁 script/iframe/svg/on*</span></div>
+          </div>
+
+          <h3 style="margin-top:18px">术语表</h3>
+          <table class="guide-table">
+            <thead><tr><th>术语</th><th>白话解释</th></tr></thead>
+            <tbody>
+              <tr><td><b>选择器 selector</b></td><td>告诉样式“给谁”的定位写法，如 <code>.markdown-body status</code></td></tr>
+              <tr><td><b>作用域 scope</b></td><td>样式起效的范围。系统自动把你的 CSS 限定在这张卡的内容里</td></tr>
+              <tr><td><b>归一 normalize</b></td><td>系统把不同写法统一成同一种形式（如 top_status → top-status）</td></tr>
+              <tr><td><b>剥壳 unwrap</b></td><td>移除外层标签但保留里面的文字</td></tr>
+              <tr><td><b>沙箱 sandbox</b></td><td>把内容关在固定范围内的保护机制</td></tr>
+              <tr><td><b>白名单 whitelist</b></td><td>只有列出的才允许通过</td></tr>
+              <tr><td><b>伪类 pseudo-class</b></td><td>:hover 这类“状态选择器”，悬停 / 选中时才生效</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+    </main>
+  </div>
+</div>
+
+<script src="/app/js/pages/creation-guide.js"></script>
+</body>
+</html>

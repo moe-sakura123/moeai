@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>控制台 · 蜜丝AI</title>
+  <link rel="stylesheet" href="/app/css/app.css">
+  <link rel="stylesheet" href="/css/console.css">
+  <style>
+    .console-header {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 16px; flex-wrap: wrap; padding: 12px 26px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(24, 24, 47, .55);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+    }
+    .console-head h1 { margin: 0; font-size: 16px; font-weight: 700; letter-spacing: .02em; }
+    .console-head p { margin: 2px 0 0; font-size: 11px; color: var(--muted); }
+    .console-header .topnav { flex: 1 1 auto; justify-content: flex-end; }
+    main#main { max-width: none; margin: 0; padding: 22px 26px 44px; }
+    @media (max-width: 768px) {
+      .console-header { justify-content: flex-start; padding: 10px 14px; }
+      main#main { padding: 16px 14px 36px; }
+    }
+  </style>
+</head>
+<body>
+<div id="topbar"></div>
+
+<div class="console-header">
+  <div class="console-head">
+    <h1>控制台</h1>
+    <p>本地数据 · 管理 · 运维</p>
+  </div>
+  <nav class="topnav" id="tabs">
+    <button type="button" data-view="database" class="on">数据库</button>
+    <button type="button" data-view="logs">访问日志</button>
+    <button type="button" data-view="users">账号</button>
+    <button type="button" data-view="points">积分管理</button>
+    <button type="button" data-view="consumption">消耗管理</button>
+    <button type="button" data-view="rules">规则管理</button>
+    <button type="button" data-view="favorites">收藏</button>
+    <button type="button" data-view="chat">对话</button>
+    <button type="button" data-view="images">图片库</button>
+    <button type="button" data-view="llm">聊天模型</button>
+    <button type="button" data-view="draw">绘图模型</button>
+    <button type="button" data-view="works">内容库</button>
+    <button type="button" data-view="creation">创作数据</button>
+    <button type="button" data-view="creative">创意广场</button>
+  </nav>
+</div>
+
+<main id="main">
+  <section id="view-database" class="view on"></section>
+  <section id="view-logs" class="view"></section>
+  <section id="view-users" class="view"></section>
+  <section id="view-points" class="view"></section>
+  <section id="view-consumption" class="view"></section>
+  <section id="view-rules" class="view"></section>
+  <section id="view-favorites" class="view"></section>
+  <section id="view-chat" class="view"></section>
+  <section id="view-images" class="view"></section>
+  <section id="view-llm" class="view"></section>
+  <section id="view-draw" class="view"></section>
+  <section id="view-works" class="view"></section>
+  <section id="view-creation" class="view"></section>
+  <section id="view-creative" class="view"></section>
+</main>
+
+<div class="modal-backdrop" id="db-modal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="db-modal-title">
+    <div class="modal-head">
+      <h3 id="db-modal-title"></h3>
+      <button type="button" class="modal-x" id="db-modal-close" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-body" id="db-modal-body"></div>
+    <div class="modal-foot" id="db-modal-foot"></div>
+  </div>
+</div>
+
+<div class="toast" id="db-toast" hidden></div>
+
+<script src="/app/js/core/guard.js"></script>
+<script src="/app/js/core/api.js"></script>
+<script src="/app/js/core/store.js"></script>
+<script src="/app/js/core/ui.js"></script>
+<script src="/js/console.js?v=20261102a"></script>
+<script>
+  App.ui.mountTopbar('console');
+</script>
+</body>
+</html>

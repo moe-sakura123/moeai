@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>AI 绘图 · 蜜丝AI</title>
+  <link rel="stylesheet" href="/app/css/app.css">
+  <style>
+    .model-list { display: flex; flex-direction: column; gap: 8px; }
+    .model-card {
+      display: flex; align-items: center; gap: 10px; text-align: left;
+      padding: 9px 11px; border-radius: 10px; cursor: pointer;
+      border: 1px solid var(--line); background: var(--panel-3); color: var(--text);
+    }
+    .model-card:hover { border-color: rgba(168, 85, 247, .45); }
+    .model-card.on { border-color: rgba(168, 85, 247, .7); background: rgba(168, 85, 247, .16); }
+    .model-card .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--purple); flex: 0 0 auto; }
+    .model-card.video .dot { background: var(--pink); }
+    .model-card b { font-size: 13px; display: block; }
+    .model-card small { font-size: 11px; color: var(--muted-2); }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chips button {
+      font-size: 12px; padding: 3px 9px; border-radius: 999px; cursor: pointer;
+      border: 1px solid var(--line); background: rgba(255, 255, 255, .04); color: var(--muted);
+    }
+    .chips button.on { color: #fff; border-color: rgba(168, 85, 247, .6); background: rgba(168, 85, 247, .2); }
+    .gallery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; }
+    .gallery-item { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: var(--panel-3); }
+    .gallery-item img { width: 100%; aspect-ratio: 1 / 1; object-fit: cover; display: block; cursor: zoom-in; background: #1b1b2f; }
+    .gallery-item video { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; display: block; cursor: pointer; background: #000; }
+    .gallery-item .g-body { padding: 8px 10px 10px; }
+    .gallery-item .g-body p { margin: 0 0 6px; font-size: 11px; color: var(--muted); height: 30px; overflow: hidden; }
+    .gallery-item .g-foot { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted-2); }
+    .gallery-item .g-foot .grow { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .progress-line { height: 6px; border-radius: 999px; background: rgba(255, 255, 255, .08); overflow: hidden; }
+    .progress-line span { display: block; height: 100%; width: 40%; border-radius: 999px;
+      background: linear-gradient(90deg, var(--purple), var(--pink)); animation: pl 1.1s ease-in-out infinite; }
+    @keyframes pl { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
+  </style>
+  <script src="/app/js/core/guard.js"></script>
+  <script src="/app/js/core/api.js"></script>
+  <script src="/app/js/core/store.js"></script>
+  <script src="/app/js/core/ui.js"></script>
+</head>
+<body>
+<div id="topbar"></div>
+
+<div class="page-wrap">
+  <div class="page-head">
+    <div>
+      <h1>AI 绘图</h1>
+      <p>写提示词生成图片；未接入绘图模型时使用本地占位绘图（不联网）</p>
+    </div>
+    <span class="tiny muted" id="model-hint">—</span>
+  </div>
+
+  <div class="split">
+    <aside class="stack">
+      <div class="panel">
+        <div class="panel-head"><b>账号</b></div>
+        <div class="panel-body" id="me-box">
+          <div class="loading-line">加载中…</div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><b>绘图模型</b></div>
+        <div class="panel-body tight">
+          <div class="model-list" id="model-list"></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><b>视频模型</b></div>
+        <div class="panel-body tight">
+          <div class="model-list" id="video-model-list"></div>
+        </div>
+      </div>
+    </aside>
+
+    <div class="stack">
+      <form class="panel" id="draw-form">
+        <div class="panel-head"><b>创作</b>
+          <span class="tiny muted">Ctrl + Enter 生成</span>
+        </div>
+        <div class="panel-body">
+          <div class="field">
+            <label>模板 <span class="hint">内置绘图模板；选中后按模板定义渲染表单字段</span></label>
+            <select class="select" id="template">
+              <option value="">自定义（不使用模板）</option>
+            </select>
+            <p class="tiny muted" id="template-hint" style="margin:6px 0 0"></p>
+            <div class="stack" style="gap:10px;margin-top:10px" id="template-fields" hidden></div>
+            <p class="tiny muted" id="template-preview" style="margin:10px 0 0;line-height:1.6;word-break:break-all" hidden></p>
+          </div>
+          <div class="field">
+            <label id="prompt-label">提示词 <span class="req">*</span></label>
+            <textarea class="textarea" id="prompt" rows="4"
+              placeholder="描述画面：人物、场景、光线、构图…"></textarea>
+          </div>
+          <div class="field">
+            <label>反向提示词</label>
+            <input class="input" id="negative" placeholder="不希望出现的元素（可留空）">
+          </div>
+          <div class="row" style="gap:12px;align-items:flex-end">
+            <div class="field grow" style="margin:0" id="size-field">
+              <label>尺寸</label>
+              <select class="select" id="size"></select>
+            </div>
+            <div class="field" style="margin:0;width:100px">
+              <label>数量</label>
+              <select class="select" id="num">
+                <option value="1">1 张</option>
+                <option value="2">2 张</option>
+                <option value="4">4 张</option>
+              </select>
+            </div>
+            <div class="field" style="margin:0;width:130px">
+              <label>种子</label>
+              <input class="input" id="seed" type="number" min="0" max="2147483647" value="0">
+            </div>
+          </div>
+          <div class="field" style="margin-top:14px">
+            <label>提示词构建器 <span class="hint">点选后点「追加」写入提示词；直接生成也会自动带上</span></label>
+            <div class="stack" style="gap:8px" id="builder"></div>
+            <div class="row" style="margin-top:8px">
+              <button type="button" class="btn sm" id="builder-apply">追加</button>
+              <button type="button" class="btn sm ghost" id="builder-reset">清空选择</button>
+              <span class="tiny muted" id="builder-preview">（未选择）</span>
+            </div>
+          </div>
+          <div id="progress" hidden style="margin-top:12px">
+            <div class="progress-line"><span></span></div>
+            <p class="tiny muted" style="margin:6px 0 0" id="progress-text">正在生成，请稍候…</p>
+          </div>
+          <p class="small" id="hint" style="min-height:18px;margin:10px 0 0"></p>
+          <div class="row between" style="margin-top:6px">
+            <span class="tiny muted" id="points">—</span>
+            <button class="btn primary" id="btn-generate">开始生成</button>
+          </div>
+        </div>
+      </form>
+
+      <div class="panel">
+        <div class="panel-head">
+          <b>我的图库</b>
+          <div class="row" style="gap:8px">
+            <button class="btn sm" data-scope="new" id="scope-new">最新</button>
+            <button class="btn sm" data-scope="hot" id="scope-hot">最热</button>
+            <button class="btn sm" data-scope="mine" id="scope-mine">我的</button>
+            <button class="btn sm" id="btn-refresh">刷新</button>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div id="gallery"><div class="loading-line">加载中…</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/app/js/pages/draw.js"></script>
+</body>
+</html>

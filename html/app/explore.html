@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>探索 · 蜜丝AI</title>
+  <link rel="stylesheet" href="/app/css/app.css">
+  <script src="/app/js/core/guard.js"></script>
+  <script src="/app/js/core/api.js"></script>
+  <script src="/app/js/core/store.js"></script>
+  <script src="/app/js/core/ui.js"></script>
+</head>
+<body>
+<div id="topbar"></div>
+
+<div class="page-wrap">
+  <div class="page-head">
+    <div>
+      <h1>探索</h1>
+      <p>发现本地已发布的角色，点开卡片直接开聊</p>
+    </div>
+    <div class="row">
+      <input class="input" id="q" placeholder="搜索角色、作者、简介" style="width:240px">
+      <button class="btn primary" id="btn-search">搜索</button>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-bottom:16px">
+    <div class="panel-body tight" style="gap:10px">
+      <div class="row between">
+        <div class="tabs" id="sorts">
+          <button class="active" data-sort="latest">最新</button>
+          <button data-sort="hot">最热</button>
+          <button data-sort="rate">高分</button>
+        </div>
+        <span class="tiny muted" id="count">—</span>
+      </div>
+      <div class="explore-tags" id="tags"></div>
+    </div>
+  </div>
+
+  <div id="grid" class="explore-grid"></div>
+
+  <div class="row" style="justify-content:center;margin-top:18px">
+    <button class="btn" id="btn-more" hidden>加载更多</button>
+  </div>
+</div>
+
+<script src="/app/js/pages/explore.js"></script>
+</body>
+</html>

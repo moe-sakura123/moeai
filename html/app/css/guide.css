@@ -1,0 +1,120 @@
+/* guide.css — /creation-guide/html-css 本地化教程页专用样式（零外部依赖） */
+
+.guide-hero {
+  display: flex; align-items: flex-end; justify-content: space-between; gap: 18px;
+  padding: 22px 24px; margin-bottom: 16px; flex-wrap: wrap;
+  border: 1px solid var(--line); border-radius: 16px;
+  background:
+    radial-gradient(620px 260px at 0% 0%, rgba(168, 85, 247, .22), transparent 70%),
+    linear-gradient(180deg, rgba(38, 38, 62, .82), rgba(28, 28, 48, .82));
+}
+.guide-hero h1 { margin: 8px 0 6px; font-size: 22px; letter-spacing: .01em; }
+.guide-hero p { margin: 0; color: var(--muted); font-size: 13px; max-width: 760px; }
+
+.guide-split { grid-template-columns: 220px minmax(0, 1fr); }
+
+.guide-toc { position: sticky; top: 72px; padding: 8px; }
+.guide-toc a {
+  display: block; padding: 7px 10px; border-radius: 8px;
+  font-size: 12px; color: var(--muted);
+}
+.guide-toc a:hover { color: var(--text); background: rgba(255, 255, 255, .05); }
+.guide-toc a.on { color: #fff; background: rgba(168, 85, 247, .18); }
+
+.guide-sec { scroll-margin-top: 84px; }
+.guide-sec .panel-head b { font-size: 14px; }
+.guide-sec .panel-body { padding: 18px 20px 20px; }
+.guide-sec h3 { margin: 22px 0 8px; font-size: 15px; }
+.guide-sec h3:first-child { margin-top: 0; }
+.guide-sec p { margin: 8px 0; color: #d7d7e5; font-size: 13px; }
+.guide-sec ul, .guide-sec ol { margin: 8px 0; padding-left: 20px; color: #d7d7e5; font-size: 13px; }
+.guide-sec li { margin: 4px 0; }
+.guide-sec code {
+  padding: 1px 5px; border-radius: 5px; font-size: 12px;
+  background: rgba(255, 255, 255, .08); border: 1px solid var(--line);
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+}
+.guide-sec a.link { color: #c4b5fd; text-decoration: underline; text-underline-offset: 2px; }
+
+.guide-table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 12.5px; }
+.guide-table th, .guide-table td {
+  border: 1px solid var(--line-2); padding: 7px 10px; text-align: left; vertical-align: top;
+}
+.guide-table th { background: rgba(168, 85, 247, .14); color: #fff; font-weight: 600; }
+.guide-table td { color: #d7d7e5; }
+
+.callout {
+  margin: 12px 0; padding: 10px 14px; border-radius: 10px; font-size: 12.5px;
+  border: 1px solid var(--line-2); background: rgba(255, 255, 255, .04);
+}
+.callout b { color: #fff; }
+.callout.warn { border-color: rgba(251, 191, 36, .45); background: rgba(251, 191, 36, .08); }
+.callout.bad { border-color: rgba(248, 113, 113, .45); background: rgba(248, 113, 113, .08); }
+.callout.ok { border-color: rgba(52, 211, 153, .45); background: rgba(52, 211, 153, .08); }
+
+/* ------------------------------------------------------------ 试验台 */
+.lab { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+@media (max-width: 900px) { .lab { grid-template-columns: 1fr; } .guide-split { grid-template-columns: 1fr; } .guide-toc { position: static; } }
+.lab-side { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.lab-tabs { display: flex; gap: 4px; }
+.lab-tabs button {
+  padding: 5px 12px; font: inherit; font-size: 12px; color: var(--muted);
+  background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 8px 8px 0 0; cursor: pointer;
+}
+.lab-tabs button.on { color: #fff; background: rgba(168, 85, 247, .22); border-color: rgba(168, 85, 247, .5); }
+
+.code-area {
+  width: 100%; min-height: 300px; height: 340px; resize: vertical;
+  padding: 12px 14px; color: #e8e8f4;
+  background: #131322; border: 1px solid var(--line-2); border-radius: 10px;
+  font: 12.5px/1.65 ui-monospace, "Cascadia Code", Consolas, monospace;
+  outline: none; tab-size: 2; white-space: pre; overflow: auto;
+}
+.code-area:focus { border-color: rgba(168, 85, 247, .7); box-shadow: 0 0 0 3px rgba(168, 85, 247, .16); }
+
+.lab-preview {
+  width: 100%; height: 424px; border: 1px solid var(--line-2);
+  border-radius: 10px; background: #111119; display: block;
+}
+.lab-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.chip {
+  padding: 5px 11px; font: inherit; font-size: 12px; color: var(--muted); cursor: pointer;
+  background: rgba(255, 255, 255, .04); border: 1px solid var(--line-2); border-radius: 999px;
+}
+.chip:hover { color: #fff; border-color: rgba(168, 85, 247, .5); background: rgba(168, 85, 247, .14); }
+.chip.on { color: #fff; border-color: rgba(168, 85, 247, .6); background: rgba(168, 85, 247, .22); }
+
+/* ------------------------------------------------------------ 模板库 */
+.tpl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+.tpl-card {
+  display: flex; flex-direction: column; gap: 8px; padding: 12px;
+  border: 1px solid var(--line); border-radius: 12px; background: rgba(255, 255, 255, .03);
+}
+.tpl-card h4 { margin: 0; font-size: 13px; }
+.tpl-card .tpl-tags { display: flex; gap: 6px; flex-wrap: wrap; }
+.tpl-card .tpl-preview { height: 120px; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); }
+.tpl-card .tpl-preview iframe { width: 100%; height: 120px; border: 0; display: block; background: #111119; }
+.tpl-card .row { margin-top: auto; }
+
+/* ------------------------------------------------------------ 其他 */
+.guide-details {
+  margin: 10px 0; padding: 10px 14px; border: 1px solid var(--line-2); border-radius: 10px;
+  background: rgba(255, 255, 255, .03); font-size: 13px;
+}
+.guide-details > summary { cursor: pointer; color: #fff; font-weight: 600; font-size: 13px; }
+.guide-details[open] > summary { margin-bottom: 8px; }
+.guide-details p { margin: 6px 0; color: #d7d7e5; }
+
+.cheat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
+.cheat {
+  padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line-2);
+  background: rgba(168, 85, 247, .07);
+}
+.cheat b { display: block; font-size: 12px; color: #fff; margin-bottom: 2px; }
+.cheat span { font-size: 12px; color: var(--muted); }
+
+.anchor-num {
+  display: inline-grid; place-items: center; width: 22px; height: 22px; margin-right: 6px;
+  border-radius: 50%; font-size: 12px; font-weight: 700;
+  background: rgba(168, 85, 247, .25); border: 1px solid rgba(168, 85, 247, .5); color: #fff;
+}

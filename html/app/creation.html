@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>创作中心 · 蜜丝AI</title>
+  <link rel="stylesheet" href="/app/css/app.css">
+  <script src="/app/js/core/guard.js"></script>
+  <script src="/app/js/core/api.js"></script>
+  <script src="/app/js/core/store.js"></script>
+  <script src="/app/js/core/ui.js"></script>
+</head>
+<body class="page-creation">
+<div id="topbar"></div>
+
+<div class="page-wrap">
+  <div class="page-head">
+    <div>
+      <h1>创作中心</h1>
+      <p>角色资料 → 保存 → 去聊天。所有数据存在本地库，不依赖线上。</p>
+    </div>
+    <div class="row">
+      <span id="save-state" class="tiny muted">未修改</span>
+      <button class="btn sm ghost" id="btn-new">新建</button>
+      <a class="btn sm" href="/creation-guide/html-css" target="_blank">HTML/CSS 教程</a>
+      <button class="btn sm ghost" id="btn-import">导入 JSON</button>
+      <button class="btn sm ghost" id="btn-export">导出 JSON</button>
+      <input type="file" id="card-file" accept="application/json,.json" hidden>
+      <button class="btn sm ghost" id="btn-preview">预览角色</button>
+      <button class="btn sm primary" id="btn-save">保存作品</button>
+    </div>
+  </div>
+
+  <div class="split">
+    <div class="creation-main">
+      <main class="stack">
+      <div class="panel">
+        <div class="panel-head">
+          <div class="tabs" id="tabs">
+            <button data-tab="base" class="active">基础信息</button>
+            <button data-tab="setting">角色介绍</button>
+            <button data-tab="greet">开场白</button>
+            <button data-tab="quick">快捷指令</button>
+            <button data-tab="prompt">提示词</button>
+            <button data-tab="example">回复样式</button>
+            <button data-tab="worldbook">世界书</button>
+            <button data-tab="cg">CG 图</button>
+            <button data-tab="publish">发布</button>
+          </div>
+          <span id="tab-hint" class="tiny muted"></span>
+        </div>
+        <div class="panel-body">
+
+          <!-- 基础信息 -->
+          <section data-panel="base">
+            <div class="base-grid">
+              <div class="cover-col">
+                <label class="base-label">封面图片</label>
+                <button type="button" class="cover-drop" id="btn-upload">
+                  <svg class="cd-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <rect x="3" y="3" width="18" height="18" rx="3"></rect>
+                    <circle cx="8.5" cy="8.5" r="1.6"></circle>
+                    <path d="M21 15l-5-5L5 21"></path>
+                  </svg>
+                  <span class="cd-t">上传封面图片</span>
+                  <span class="cd-b">选择文件</span>
+                  <img id="cover-preview" alt="" hidden>
+                </button>
+                <button type="button" class="cover-remove" id="btn-remove-cover" hidden>移除</button>
+                <p class="cover-warn">禁止上传未满18岁（18禁）的封面</p>
+                <input id="f-avatar" type="hidden">
+                <input type="file" id="cover-file" accept="image/*" hidden>
+              </div>
+              <div class="base-fields">
+                <div class="field">
+                  <label>角色名称 <span class="req">*</span> <span class="hint">（2-50字）</span></label>
+                  <input class="input" id="f-name" maxlength="50" placeholder="输入角色名称">
+                </div>
+                <div class="field">
+                  <label>角色简介 <span class="req">*</span> <span class="hint">（最多500字）</span></label>
+                  <div class="ta-wrap">
+                    <textarea class="textarea" id="f-summary" rows="5" maxlength="500" placeholder="输入角色简介"></textarea>
+                    <span class="char-count" data-for="f-summary">0/500</span>
+                  </div>
+                </div>
+                <div class="field">
+                  <label>创作者备注 <span class="hint">（选填）</span></label>
+                  <div class="ta-wrap">
+                    <textarea class="textarea" id="f-comment" rows="4" maxlength="500" placeholder="可以在这里写一些给读者的话，如创作灵感、使用说明等"></textarea>
+                    <span class="char-count" data-for="f-comment">0/500</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="field" style="margin-top:16px">
+              <label>分类/性向/标签 <span class="req">*</span>
+                <span class="hint">JSON: genderOrientation / extensions / tags</span></label>
+              <button type="button" class="input picker-row" id="btn-category">
+                <span id="cat-summary" class="muted">点击选择分类、性向和标签</span>
+                <span class="chev">›</span>
+              </button>
+            </div>
+          </section>
+
+          <!-- 角色介绍 -->
+          <section data-panel="setting" hidden>
+            <div class="field">
+              <label>详细介绍</label>
+              <div class="hint-line"><span class="info-i">ⓘ</span>支持HTML和CSS，保存后可在预览区查看效果</div>
+              <div class="code-box code-editor-dark" id="desc-box">
+                <div class="code-hl" id="desc-hl" aria-hidden="true"><pre id="desc-pre"></pre></div>
+                <textarea class="code-area" id="f-description" rows="14" spellcheck="false"
+                  placeholder="输入详细介绍，支持HTML和CSS..."></textarea>
+                <button type="button" class="fs-btn" id="desc-full">
+                  <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M4 9V4h5M20 15v5h-5M20 9V4h-5M4 15v5h5"></path>
+                  </svg><span>全屏</span>
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <!-- 提示词（对应 JSON: promptData / customCSS / blockedWords） -->
+          <section data-panel="prompt" hidden>
+            <div class="field">
+              <div class="field-title">
+                <div class="field-title-left">
+                  <label>破甲词 <span class="hint">promptData.breakArmorWord</span></label>
+                  <button type="button" class="plaza-pill" id="btn-break-plaza">从创意广场引用</button>
+                </div>
+                <div class="switch-row">
+                  <span class="tiny muted">自定义</span>
+                  <label class="switch"><input type="checkbox" id="sw-break"><i></i></label>
+                </div>
+              </div>
+              <div class="info-card" id="break-default">
+                <span class="info-i">ⓘ</span>默认使用系统破甲词，如需自定义，请启动开关。
+              </div>
+              <div id="break-editor" hidden></div>
+            </div>
+            <div class="field">
+              <label>AI 身份设定 <span class="hint">promptData.aiIdentityStylePrompt</span></label>
+              <div id="rich-ai-identity"></div>
+            </div>
+            <div class="field">
+              <label>世界观设定 <span class="hint">promptData.worldViewPrompt</span></label>
+              <div id="rich-worldview"></div>
+            </div>
+            <div class="field">
+              <label>系统提示词 / 主提示词 <span class="hint">promptData.systemPrompt</span></label>
+              <div id="rich-system"></div>
+            </div>
+            <div class="field">
+              <div class="field-title">
+                <div class="field-title-left">
+                  <label>写作风格 <span class="hint">promptData.writingStylePrompt</span></label>
+                  <button type="button" class="plaza-pill" id="btn-writing-plaza">从创意广场引用</button>
+                </div>
+              </div>
+              <div id="rich-writing"></div>
+            </div>
+            <!-- 剧情选项（默认系统词 / 开关后自定义，富文本） -->
+            <div class="field">
+              <div class="field-title">
+                <div class="field-title-left">
+                  <label>下一步剧情选项 <span class="hint">promptData.postPrompt</span></label>
+                </div>
+                <div class="switch-row">
+                  <span class="tiny muted">自定义</span>
+                  <label class="switch"><input type="checkbox" id="sw-next"><i></i></label>
+                </div>
+              </div>
+              <div class="info-card" id="next-default">
+                <span class="info-i">ⓘ</span>默认使用系统的下一步剧情提示词，如需自定义，请启用开关。
+              </div>
+              <div id="next-hint" class="tiny muted" style="margin:2px 0 8px" hidden>
+                自定义时，请务必让AI使用&lt;next_prompt&gt;&lt;/next_prompt&gt;标签对输出的选项进行包裹。
+              </div>
+              <div id="next-editor" hidden></div>
+            </div>
+          </section>
+
+          <!-- 开场白（参照源站：卡片 + 富文本工具栏 + 全屏） -->
+          <section data-panel="greet" hidden>
+            <div class="greet-head">
+              <label class="greet-title-main"><span class="greet-ico">✦</span>开场白 <span class="req">*</span></label>
+              <button type="button" class="btn sm primary" id="btn-add-greet">＋ 添加</button>
+            </div>
+            <div id="greet-list" class="greet-list"></div>
+          </section>
+
+          <!-- 快捷指令（参照源站：标题 + 内容，最多 10 个） -->
+          <section data-panel="quick" hidden>
+            <div class="quick-head">
+              <span class="quick-title"><span class="quick-ico">⚡</span>快捷指令
+                <i class="quick-count" id="qc-count">0</i></span>
+            </div>
+            <p class="quick-hint">设置快捷指令，用户在聊天时可以快速选择发送。最多添加 10 个。</p>
+            <div id="qc-list" class="qc-list"></div>
+            <button type="button" class="qc-add" id="btn-add-qc">＋ 添加快捷指令</button>
+          </section>
+
+          <!-- 回复样式 -->
+          <section data-panel="example" hidden>
+            <div class="field">
+              <label>回复样式</label>
+              <div id="rich-example"></div>
+              <span class="hint">给模型参考的回复格式与风格样本，可留空。</span>
+            </div>
+            <div class="field">
+              <label>自定义 CSS <span class="hint">customCSS · 只影响聊天气泡样式</span></label>
+              <div class="css-warn" id="css-warn" hidden></div>
+              <div class="code-box code-editor-dark" id="css-box">
+                <div class="code-hl" id="css-hl" aria-hidden="true"><pre id="css-pre"></pre></div>
+                <textarea class="code-area" id="f-customcss" rows="8" spellcheck="false"
+                  placeholder=".markdown-body say{ … }"></textarea>
+                <button type="button" class="fs-btn" id="css-full">
+                  <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M4 9V4h5M20 15v5h-5M20 9V4h-5M4 15v5h5"></path>
+                  </svg><span>全屏</span>
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <!-- 世界书（对应 JSON: world_book） -->
+          <section data-panel="worldbook" hidden>
+            <div class="row between" style="margin-bottom:10px">
+              <span class="tiny muted">当前角色的世界书条目；导入 / 导出角色卡时会一并带上 world_book。</span>
+              <div class="row">
+                <button class="btn sm" id="btn-wb-refresh">刷新</button>
+                <a class="btn sm primary" id="btn-wb-manage" href="/app/worldbook">管理世界书</a>
+              </div>
+            </div>
+            <div id="wb-list-mini" class="stack"><div class="loading-line">加载中…</div></div>
+          </section>
+
+          <!-- CG 图 -->
+          <section data-panel="cg" hidden>
+            <div class="row between" style="margin-bottom:10px">
+              <span class="tiny muted">CG 图会在聊天中按关键词触发显示，保存在本地图片库。</span>
+              <div class="row">
+                <button class="btn sm" id="btn-cg-io">导入/导出</button>
+                <select class="select" id="cg-mode" style="width:auto">
+                  <option value="platform_default">平台默认规则</option>
+                  <option value="custom">自定义提示词</option>
+                  <option value="off">关闭 CG</option>
+                </select>
+                <button class="btn sm" id="btn-cg-upload">上传 CG</button>
+                <input type="file" id="cg-file" accept="image/*" hidden>
+                <button class="btn sm ghost" id="btn-cg-refresh">刷新</button>
+              </div>
+            </div>
+            <div id="cg-hint-wrap" class="field" hidden>
+              <label>CG 触发提示词</label>
+              <textarea class="textarea" id="cg-hint" rows="2" placeholder="描述什么时候插入 CG"></textarea>
+              <div class="row"><button class="btn sm" id="btn-cg-hint-save">保存规则</button></div>
+            </div>
+            <div id="cg-default-rule" class="tiny muted" style="margin:0 0 10px;line-height:1.6" hidden></div>
+            <div id="cg-stats" class="row" style="gap:10px;margin:8px 0;flex-wrap:wrap"></div>
+            <div id="cg-filter-bar" class="row" style="gap:6px;margin-bottom:8px"></div>
+            <div id="cg-list" class="card-grid"></div>
+          </section>
+
+          <!-- 发布 -->
+          <section data-panel="publish" hidden>
+            <div class="panel" style="background:rgba(0,0,0,.15)">
+              <div class="panel-body">
+                <div class="row between">
+                  <div>
+                    <b>发布状态</b>
+                    <div class="tiny muted">发布后会出现在探索页；下架随时可以。</div>
+                  </div>
+                  <span id="pub-badge" class="badge">草稿</span>
+                </div>
+                <div class="row" style="margin-top:14px">
+                  <button class="btn sm primary" id="btn-publish">发布作品</button>
+                  <button class="btn sm" id="btn-unpublish">下架</button>
+                </div>
+                <div class="tiny muted" id="pub-gate-hint" style="margin-top:8px"></div>
+                <div class="row" style="margin-top:10px">
+                  <a class="btn sm" id="btn-chat">去聊天</a>
+                  <a class="btn sm ghost" id="btn-worldbook">世界书</a>
+                  <button class="btn sm danger" id="btn-delete">删除作品</button>
+                </div>
+
+              </div>
+            </div>
+          </section>
+
+        </div>
+      </div>
+    </main>
+
+      <!-- 右侧：实时预览（一半操作 / 一半预览，参照源站） -->
+      <aside class="preview-pane">
+        <div class="panel pv-panel">
+          <div class="panel-head">
+            <div class="tabs" id="pv-tabs">
+              <button data-pv="desc" class="active">详细介绍预览</button>
+              <button data-pv="prompt">提示词预览</button>
+              <button data-pv="reply">回复样式预览</button>
+            </div>
+            <span class="tiny muted" id="pv-hint">实时</span>
+          </div>
+          <div class="panel-body pv-body">
+            <div class="pv-head">
+              <img id="pv-cover" alt="" class="pv-cover">
+              <div class="grow">
+                <b id="pv-name">未命名作品</b>
+                <div id="pv-sub" class="tiny muted"></div>
+                <div id="pv-chips" class="row" style="margin-top:6px;gap:4px"></div>
+              </div>
+            </div>
+            <div id="pv-live" class="pv-frame"></div>
+            <div id="pv-prompt" class="pv-prompt" hidden></div>
+            <div id="pv-reply" class="pv-prompt" hidden></div>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </div>
+</div>
+
+<script src="/app/js/pages/creation.js?v=5"></script>
+</body>
+</html>

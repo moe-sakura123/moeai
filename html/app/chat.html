@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>聊天 · 蜜丝AI</title>
+  <link rel="stylesheet" href="/app/css/app.css">
+  <script src="/app/js/core/guard.js"></script>
+  <script src="/app/js/core/api.js"></script>
+  <script src="/app/js/core/store.js"></script>
+  <script src="/app/js/core/ui.js"></script>
+  <script src="/app/js/core/sse.js?v=5"></script>
+</head>
+<body>
+<div id="topbar"></div>
+
+<div class="chat-shell">
+  <aside class="chat-side">
+    <div class="char">
+      <div class="row" style="align-items:flex-start;gap:12px">
+        <img id="c-avatar" alt="" src="">
+        <div class="grow">
+          <h2 id="c-name">正在读取角色…</h2>
+          <div class="row" id="c-tags" style="margin-top:4px"></div>
+        </div>
+      </div>
+      <p id="c-summary" class="muted">—</p>
+      <div class="row" style="gap:6px">
+        <button class="btn sm primary" id="btn-new-session">新对话</button>
+        <button class="btn sm" id="btn-restart">重开</button>
+        <a class="btn sm ghost" id="link-edit">编辑</a>
+        <a class="btn sm ghost" id="link-worldbook">世界书</a>
+      </div>
+    </div>
+    <div class="panel-head" style="border-top:1px solid var(--line)">
+      <b>最近对话</b><button type="button" class="tiny muted linklike" id="btn-session-multi">全部</button>
+    </div>
+    <div class="side-scroll" id="session-list">
+      <div class="loading-line">加载中…</div>
+    </div>
+    <div id="session-batch-bar" class="session-batch-bar" hidden>
+      <label class="batch-all"><input type="checkbox" id="batch-select-all"> 全选</label>
+      <button type="button" class="btn sm danger" id="btn-batch-delete">删除所选对话</button>
+      <button type="button" class="btn sm ghost" id="btn-batch-cancel">取消</button>
+    </div>
+  </aside>
+
+  <section class="chat-main">
+    <div class="chat-titlebar">
+      <b id="chat-title">—</b>
+      <div class="row" style="gap:8px">
+        <span id="chat-state" class="tiny muted"></span>
+        <div class="model-pick" id="model-pick" hidden>
+          <button type="button" class="model-pill" id="btn-model" title="切换模型">
+            <i class="mp-dot"></i><span id="model-name">模型</span><i class="mp-caret"></i>
+          </button>
+          <div class="model-menu" id="model-menu" hidden>
+            <div class="mm-head">选择模型<span id="model-menu-cur" class="tiny muted"></span></div>
+            <div class="mm-list" id="model-list"></div>
+          </div>
+        </div>
+        <button class="btn sm ghost" id="btn-clear">清空对话</button>
+      </div>
+    </div>
+
+    <div class="chat-scroll" id="chat-scroll">
+      <div class="empty-center">正在打开对话…</div>
+    </div>
+
+    <div class="composer">
+      <div class="tool-row" id="tool-row">
+        <button type="button" class="tool-btn on" id="tb-stream" title="流式输出开关">流式</button>
+        <button type="button" class="tool-btn" id="tb-comment" title="评论">评论</button>
+        <button type="button" class="tool-btn" id="tb-custom" title="我的自定义设定">自定</button>
+        <button type="button" class="tool-btn" id="tb-memory" title="记忆管理">记忆</button>
+        <a class="tool-btn teal" href="/app/plaza" title="创意库">创意库</a>
+      </div>
+      <div class="box">
+        <textarea class="textarea" id="chat-input" rows="1"
+          placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
+        <button class="btn primary" id="btn-send">发送</button>
+      </div>
+      <div class="tools">
+        <span id="compose-state">Enter 发送</span>
+        <span class="grow"></span>
+        <button class="btn sm ghost" id="btn-stop" hidden>停止生成</button>
+      </div>
+    </div>
+
+    <!-- 右侧悬浮按钮（参照源站）：齿轮=对话设置，箭头=回底（不在底部时出现） -->
+    <div class="chat-float" id="chat-float" hidden>
+      <button type="button" class="cf-btn" id="btn-chat-settings" title="对话设置">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
+          stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/>
+          <circle cx="12" cy="12" r="3"/>
+        </svg>
+      </button>
+      <button type="button" class="cf-btn" id="btn-scroll-bottom" title="回底" hidden>
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
+          stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>
+        </svg>
+      </button>
+    </div>
+  </section>
+</div>
+
+<!-- 介绍网页捕获到文字后的右上角提示（内容已就绪 + 手动复制） -->
+<div class="intro-toast" id="intro-toast" hidden>
+  <span class="it-text">内容已就绪：<b id="intro-toast-text"></b></span>
+  <button type="button" class="it-copy" id="intro-copy">复制</button>
+  <button type="button" class="it-close" id="intro-close" aria-label="关闭">✕</button>
+</div>
+
+<script src="/app/js/pages/parser.js?v=1"></script>
+<script src="/app/js/pages/renderer.js?v=2"></script>
+<script src="/app/js/pages/theme_manager.js?v=1"></script>
+<script src="/app/js/pages/chat_store.js?v=1"></script>
+<script src="/app/js/pages/chat.js?v=12"></script>
+</body>
+</html>

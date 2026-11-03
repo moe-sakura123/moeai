@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>世界书 · 蜜丝AI</title>
+  <link rel="stylesheet" href="/app/css/app.css">
+  <script src="/app/js/core/guard.js"></script>
+  <script src="/app/js/core/api.js"></script>
+  <script src="/app/js/core/store.js"></script>
+  <script src="/app/js/core/ui.js"></script>
+</head>
+<body>
+<div id="topbar"></div>
+
+<div class="page-wrap">
+  <div class="page-head">
+    <div>
+      <h1>世界书</h1>
+      <p>给角色补充设定：命中关键词时自动注入上下文，聊天更稳定。</p>
+    </div>
+    <div class="row">
+      <a class="btn sm ghost" id="to-creation">去创作</a>
+      <button class="btn sm primary" id="btn-new">新建条目</button>
+    </div>
+  </div>
+
+  <div class="split wide-left">
+    <aside class="stack">
+      <div class="panel">
+        <div class="panel-head"><b>作品</b><span class="tiny muted" id="wb-count"></span></div>
+        <div class="panel-body">
+          <select class="select" id="wb-work"></select>
+          <div class="tabs" id="wb-tabs" style="margin-top:10px">
+            <button data-kind="char" class="active">角色世界书</button>
+            <button data-kind="custom">我的自定义</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><b>条目</b><span class="tiny muted" id="wb-tip">关键词命中才触发</span></div>
+        <div class="panel-body tight">
+          <div id="wb-list" class="work-list"><div class="loading-line">加载中…</div></div>
+        </div>
+      </div>
+    </aside>
+
+    <main class="stack">
+      <div class="panel">
+        <div class="panel-head">
+          <b id="editor-title">条目编辑</b>
+          <div class="row">
+            <span class="tiny muted" id="editor-state">未修改</span>
+            <button class="btn sm primary" id="btn-save">保存条目</button>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div id="editor-empty" class="empty">
+            <b>选择左侧条目，或新建一条</b>
+            世界书条目 = 标题 + 关键词 + 内容
+          </div>
+
+          <div id="editor-form" class="stack" hidden>
+            <div class="field">
+              <label>标题 <span class="req">*</span></label>
+              <input class="input" id="e-comment" maxlength="100" placeholder="例：酒馆的规矩">
+            </div>
+            <div class="field">
+              <label>关键词</label>
+              <input class="input" id="e-keys" placeholder="用逗号分隔，例：酒馆,老板,规矩">
+              <span class="hint">对话中出现这些词时，这条设定会被注入。</span>
+            </div>
+            <div class="field">
+              <label>内容</label>
+              <textarea class="textarea" id="e-content" rows="9" placeholder="这条设定要告诉模型的信息…"></textarea>
+            </div>
+            <div class="row" style="gap:18px">
+              <label class="check"><input type="checkbox" id="e-constant"> 常驻（每轮都注入）</label>
+              <label class="check"><input type="checkbox" id="e-enabled" checked> 启用</label>
+            </div>
+            <div class="row" style="gap:12px;align-items:flex-end">
+              <div class="field" style="margin:0;width:170px">
+                <label>插入位置</label>
+                <select class="select" id="e-position">
+                  <option value="0">角色设定之前</option>
+                  <option value="1">角色设定之后</option>
+                </select>
+              </div>
+              <div class="field" style="margin:0;width:120px">
+                <label>深度</label>
+                <input class="input" id="e-depth" type="number" min="0" max="50" value="4">
+              </div>
+              <div class="field" style="margin:0;width:120px">
+                <label>触发概率 %</label>
+                <input class="input" id="e-probability" type="number" min="0" max="100" value="100">
+              </div>
+              <div class="field" style="margin:0;width:100px">
+                <label>顺序</label>
+                <input class="input" id="e-order" type="number" value="0">
+              </div>
+            </div>
+            <div class="row">
+              <button class="btn sm danger" id="btn-delete">删除条目</button>
+              <button class="btn sm ghost" id="btn-clear">清空输入</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><b>数值规则</b><span class="tiny muted" id="wb-rule-scope-tip">全局默认 · 只读预览</span></div>
+        <div class="panel-body">
+          <div class="rule-scope">
+            <select class="select" id="wb-rule-scope">
+              <option value="global">使用全局默认规则</option>
+              <option value="custom">自定义覆盖（本角色专属）</option>
+            </select>
+            <span class="tiny muted">切换自定义会复制一份全局规则，之后只影响当前角色</span>
+          </div>
+          <div class="tabs" id="wb-rule-tabs"></div>
+          <div class="rule-kw tiny muted" id="wb-rule-kw"></div>
+          <div class="rule-meta" id="wb-rule-meta">
+            <span class="tiny muted">属性设置</span>
+            <label class="rule-meta-field">初始值
+              <input class="input" id="rule-initial" type="number" step="1"></label>
+            <label class="rule-meta-field">最小值
+              <input class="input" id="rule-min" type="number" step="1"></label>
+            <label class="rule-meta-field">最大值
+              <input class="input" id="rule-max" type="number" step="1"></label>
+            <button class="btn sm" id="wb-rule-meta-save">保存</button>
+          </div>
+          <div id="wb-rule-list" class="rule-list"><div class="loading-line">加载中…</div></div>
+          <div class="row rule-actions">
+            <button class="btn sm primary" id="wb-rule-new">新建</button>
+            <button class="btn sm" id="wb-rule-edit" disabled>编辑</button>
+            <button class="btn sm danger" id="wb-rule-del" disabled>删除</button>
+            <button class="btn sm ghost" id="wb-rule-export">导出 JSON</button>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<script src="/app/js/pages/worldbook.js?v=7"></script>
+</body>
+</html>

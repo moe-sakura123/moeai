@@ -1,0 +1,28 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 运行时数据（含密钥/会话，不入库）----
+# missai.db / image.db 存了账号会话、访问日志、模型接入的 api_key、绘图密钥
+# 与用户作品，属本地运行时状态，不应进版本库
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/.current_db
+
+# ---- 日志 ----
+logs/
+*.log
+
+# ---- 抓取/上传的本地图片资产（体积大、可再生）----
+html/image/
+html/assets/uploads/
+
+# ---- 系统 / 编辑器 ----
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/

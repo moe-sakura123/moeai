@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <defs>
+    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#a855f7"/>
+      <stop offset="100%" style="stop-color:#ec4899"/>
+    </linearGradient>
+  </defs>
+  <rect width="32" height="32" rx="8" fill="url(#grad)"/>
+  <!-- MessageCircle icon from Lucide, scaled and centered -->
+  <path d="M25 15.5c0 4.14-4.03 7.5-9 7.5-.87 0-1.71-.09-2.5-.27L9 24l1.36-4.08C8.89 18.57 7 17.13 7 15.5 7 11.36 11.03 8 16 8s9 3.36 9 7.5z" fill="none" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

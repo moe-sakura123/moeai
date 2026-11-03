@@ -1,0 +1,175 @@
+{
+  "_comment": "AI 绘图内置模板 · 插画立绘。控制台「绘图模型 → 模板接入 → 恢复内置」会把 json/ 下所有 *.json 合并重建目录（同名分类合并、重复 recipeKey 后到的跳过）。local 段只给后端用，前端会静默丢掉。新加内置模板：照这个结构再放一个 ai-draw-*.json 即可，重启或点「恢复内置」自动收录。",
+  "schema": "missai.template/v1",
+  "categories": [
+    {
+      "key": "illustration",
+      "name": "插画立绘",
+      "sortOrder": 10,
+      "recipes": [
+        {
+          "recipeKey": "local_guofeng_v1",
+          "version": 1,
+          "categoryKey": "illustration",
+          "name": "国风插画",
+          "description": "水墨设色、工笔线条，适合古风人物与场景",
+          "coverUrl": "/html/assets/logo-goddess1.webp",
+          "outputMediaType": "image",
+          "submitProtocol": "aiMediaRecipe",
+          "sortOrder": 10,
+          "price": { "points": 0, "pricingMode": "fixed", "isEstimate": false },
+          "schema": {
+            "fields": [
+              {
+                "key": "prompt",
+                "type": "textarea",
+                "label": "画面描述",
+                "required": true,
+                "placeholder": "例如：月下撑伞的古装少女，回眸"
+              },
+              {
+                "key": "aspectRatio",
+                "type": "select",
+                "label": "画面比例",
+                "required": false,
+                "defaultValue": "3:4",
+                "options": [
+                  { "value": "1:1", "label": "方形 1:1" },
+                  { "value": "3:4", "label": "竖版 3:4" },
+                  { "value": "4:3", "label": "横版 4:3" },
+                  { "value": "9:16", "label": "竖屏 9:16" },
+                  { "value": "16:9", "label": "横屏 16:9" }
+                ]
+              },
+              {
+                "key": "detail",
+                "type": "select",
+                "label": "细节强度",
+                "required": false,
+                "defaultValue": "standard",
+                "options": [
+                  { "value": "simple", "label": "简洁写意" },
+                  { "value": "standard", "label": "常规细节" },
+                  { "value": "rich", "label": "繁复精致" }
+                ]
+              }
+            ],
+            "mediaSlots": []
+          },
+          "local": {
+            "promptPrefix": "东方水墨国风插画，工笔设色，",
+            "promptSuffix": "，精致构图，高清细节",
+            "negative": "低质量, 模糊, 变形, 水印, 文字",
+            "size": "1024x1024",
+            "sizeByRatio": {
+              "1:1": "1024x1024",
+              "3:4": "1024x1536",
+              "4:3": "1536x1024",
+              "9:16": "1024x1536",
+              "16:9": "1536x1024"
+            },
+            "detailPrompt": {
+              "simple": "，留白写意，笔触简练",
+              "standard": "",
+              "rich": "，繁复纹样，细节堆叠"
+            }
+          }
+        },
+        {
+          "recipeKey": "local_anime_v1",
+          "version": 1,
+          "categoryKey": "illustration",
+          "name": "二次元立绘",
+          "description": "日系赛璐璐上色，干净的立绘风格",
+          "coverUrl": "/html/assets/favicon-192.png",
+          "outputMediaType": "image",
+          "submitProtocol": "aiMediaRecipe",
+          "sortOrder": 20,
+          "price": { "points": 0, "pricingMode": "fixed", "isEstimate": false },
+          "schema": {
+            "fields": [
+              {
+                "key": "prompt",
+                "type": "textarea",
+                "label": "画面描述",
+                "required": true,
+                "placeholder": "例如：白发红瞳的女剑士，半身立绘"
+              },
+              {
+                "key": "aspectRatio",
+                "type": "select",
+                "label": "画面比例",
+                "required": false,
+                "defaultValue": "3:4",
+                "options": [
+                  { "value": "1:1", "label": "方形 1:1" },
+                  { "value": "3:4", "label": "竖版 3:4" },
+                  { "value": "9:16", "label": "竖屏 9:16" }
+                ]
+              }
+            ],
+            "mediaSlots": []
+          },
+          "local": {
+            "promptPrefix": "日系二次元插画，赛璐璐上色，清晰线稿，",
+            "promptSuffix": "，干净背景，高清",
+            "negative": "写实照片风格, 低质量, 模糊, 多手多指, 水印",
+            "size": "1024x1024",
+            "sizeByRatio": {
+              "1:1": "1024x1024",
+              "3:4": "1024x1536",
+              "9:16": "1024x1536"
+            }
+          }
+        },
+        {
+          "recipeKey": "local_watercolor_v1",
+          "version": 1,
+          "categoryKey": "illustration",
+          "name": "水彩绘本",
+          "description": "柔和晕染的水彩绘本风，适合治愈题材",
+          "coverUrl": "",
+          "outputMediaType": "image",
+          "submitProtocol": "aiMediaRecipe",
+          "sortOrder": 30,
+          "price": { "points": 0, "pricingMode": "fixed", "isEstimate": false },
+          "schema": {
+            "fields": [
+              {
+                "key": "prompt",
+                "type": "textarea",
+                "label": "画面描述",
+                "required": true,
+                "placeholder": "例如：午后窗边的猫和书"
+              },
+              {
+                "key": "aspectRatio",
+                "type": "select",
+                "label": "画面比例",
+                "required": false,
+                "defaultValue": "4:3",
+                "options": [
+                  { "value": "1:1", "label": "方形 1:1" },
+                  { "value": "4:3", "label": "横版 4:3" },
+                  { "value": "16:9", "label": "横屏 16:9" }
+                ]
+              }
+            ],
+            "mediaSlots": []
+          },
+          "local": {
+            "promptPrefix": "水彩绘本插画，柔和晕染，纸张质感，",
+            "promptSuffix": "，暖色调，治愈氛围",
+            "negative": "厚涂, 3D, 低质量, 模糊, 水印",
+            "size": "1024x1024",
+            "sizeByRatio": {
+              "1:1": "1024x1024",
+              "4:3": "1536x1024",
+              "16:9": "1536x1024"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

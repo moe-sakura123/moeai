@@ -1,0 +1,130 @@
+{
+  "_comment": "AI 绘图内置模板 · 设计物料。控制台「绘图模型 → 模板接入 → 恢复内置」会把 json/ 下所有 *.json 合并重建目录（同名分类合并、重复 recipeKey 后到的跳过）。local 段只给后端用，前端会静默丢掉。",
+  "schema": "missai.template/v1",
+  "categories": [
+    {
+      "key": "design",
+      "name": "设计物料",
+      "sortOrder": 30,
+      "recipes": [
+        {
+          "recipeKey": "local_poster_v1",
+          "version": 1,
+          "categoryKey": "design",
+          "name": "海报封面",
+          "description": "强视觉焦点的平面海报，可预留标题区",
+          "coverUrl": "",
+          "outputMediaType": "image",
+          "submitProtocol": "aiMediaRecipe",
+          "sortOrder": 10,
+          "price": { "points": 0, "pricingMode": "fixed", "isEstimate": false },
+          "schema": {
+            "fields": [
+              {
+                "key": "prompt",
+                "type": "textarea",
+                "label": "主题描述",
+                "required": true,
+                "placeholder": "例如：赛博都市题材的小说封面"
+              },
+              {
+                "key": "aspectRatio",
+                "type": "select",
+                "label": "画面比例",
+                "required": false,
+                "defaultValue": "3:4",
+                "options": [
+                  { "value": "3:4", "label": "竖版 3:4" },
+                  { "value": "9:16", "label": "竖屏 9:16" },
+                  { "value": "1:1", "label": "方形 1:1" }
+                ]
+              },
+              {
+                "key": "palette",
+                "type": "select",
+                "label": "配色倾向",
+                "required": false,
+                "defaultValue": "dark",
+                "options": [
+                  { "value": "dark", "label": "暗色系" },
+                  { "value": "warm", "label": "暖色系" },
+                  { "value": "cool", "label": "冷色系" },
+                  { "value": "duotone", "label": "双色撞色" }
+                ]
+              }
+            ],
+            "mediaSlots": []
+          },
+          "local": {
+            "promptPrefix": "平面海报设计，主体突出，留白构图，",
+            "promptSuffix": "，画面干净，无文字",
+            "negative": "文字, 水印, 杂乱, 低质量",
+            "size": "1024x1536",
+            "sizeByRatio": {
+              "3:4": "1024x1536",
+              "9:16": "1024x1536",
+              "1:1": "1024x1024"
+            },
+            "fieldPrompt": {
+              "palette": {
+                "dark": "暗色系高对比配色",
+                "warm": "暖色系配色",
+                "cool": "冷色系配色",
+                "duotone": "双色撞色配色"
+              }
+            }
+          }
+        },
+        {
+          "recipeKey": "local_avatar_v1",
+          "version": 1,
+          "categoryKey": "design",
+          "name": "头像生成",
+          "description": "居中构图的社交头像，背景干净",
+          "coverUrl": "",
+          "outputMediaType": "image",
+          "submitProtocol": "aiMediaRecipe",
+          "sortOrder": 20,
+          "price": { "points": 0, "pricingMode": "fixed", "isEstimate": false },
+          "schema": {
+            "fields": [
+              {
+                "key": "prompt",
+                "type": "textarea",
+                "label": "人物/形象描述",
+                "required": true,
+                "placeholder": "例如：戴耳机的黑发少年，微笑"
+              },
+              {
+                "key": "bg",
+                "type": "select",
+                "label": "背景",
+                "required": false,
+                "defaultValue": "solid",
+                "options": [
+                  { "value": "solid", "label": "纯色" },
+                  { "value": "gradient", "label": "渐变" },
+                  { "value": "scene", "label": "环境虚化" }
+                ]
+              }
+            ],
+            "mediaSlots": []
+          },
+          "local": {
+            "promptPrefix": "社交头像，正面居中构图，肩部以上特写，",
+            "promptSuffix": "，光线柔和，高清",
+            "negative": "低质量, 模糊, 文字, 水印",
+            "size": "1024x1024",
+            "fieldPrompt": {
+              "bg": {
+                "solid": "纯色背景",
+                "gradient": "柔和渐变背景",
+                "scene": "环境虚化背景"
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

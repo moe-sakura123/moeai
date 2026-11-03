@@ -1,0 +1,128 @@
+{
+  "_comment": "AI 绘图内置模板 · 写实影像。控制台「绘图模型 → 模板接入 → 恢复内置」会把 json/ 下所有 *.json 合并重建目录（同名分类合并、重复 recipeKey 后到的跳过）。local 段只给后端用，前端会静默丢掉。",
+  "schema": "missai.template/v1",
+  "categories": [
+    {
+      "key": "photoreal",
+      "name": "写实影像",
+      "sortOrder": 20,
+      "recipes": [
+        {
+          "recipeKey": "local_portrait_v1",
+          "version": 1,
+          "categoryKey": "photoreal",
+          "name": "人像摄影",
+          "description": "自然光人像，85mm 焦段质感",
+          "coverUrl": "",
+          "outputMediaType": "image",
+          "submitProtocol": "aiMediaRecipe",
+          "sortOrder": 10,
+          "price": { "points": 0, "pricingMode": "fixed", "isEstimate": false },
+          "schema": {
+            "fields": [
+              {
+                "key": "prompt",
+                "type": "textarea",
+                "label": "画面描述",
+                "required": true,
+                "placeholder": "例如：黄昏街边的短发女生，回头微笑"
+              },
+              {
+                "key": "aspectRatio",
+                "type": "select",
+                "label": "画面比例",
+                "required": false,
+                "defaultValue": "3:4",
+                "options": [
+                  { "value": "1:1", "label": "方形 1:1" },
+                  { "value": "3:4", "label": "竖版 3:4" },
+                  { "value": "16:9", "label": "横屏 16:9" }
+                ]
+              },
+              {
+                "key": "light",
+                "type": "select",
+                "label": "光线氛围",
+                "required": false,
+                "defaultValue": "natural",
+                "options": [
+                  { "value": "natural", "label": "自然光" },
+                  { "value": "golden", "label": "黄金时刻" },
+                  { "value": "studio", "label": "影棚柔光" },
+                  { "value": "neon", "label": "霓虹夜景" }
+                ]
+              }
+            ],
+            "mediaSlots": []
+          },
+          "local": {
+            "promptPrefix": "写实人像摄影，85mm 镜头，浅景深，",
+            "promptSuffix": "，皮肤质感真实，高清细节",
+            "negative": "插画, 动漫, 低质量, 模糊, 变形, 水印",
+            "size": "1024x1024",
+            "sizeByRatio": {
+              "1:1": "1024x1024",
+              "3:4": "1024x1536",
+              "16:9": "1536x1024"
+            },
+            "fieldPrompt": {
+              "light": {
+                "natural": "自然光照明",
+                "golden": "黄金时刻侧逆光",
+                "studio": "影棚柔光箱打光",
+                "neon": "霓虹灯夜景色彩"
+              }
+            }
+          }
+        },
+        {
+          "recipeKey": "local_scene_v1",
+          "version": 1,
+          "categoryKey": "photoreal",
+          "name": "场景写实",
+          "description": "电影感场景，适合世界观与氛围图",
+          "coverUrl": "",
+          "outputMediaType": "image",
+          "submitProtocol": "aiMediaRecipe",
+          "sortOrder": 20,
+          "price": { "points": 0, "pricingMode": "fixed", "isEstimate": false },
+          "schema": {
+            "fields": [
+              {
+                "key": "prompt",
+                "type": "textarea",
+                "label": "画面描述",
+                "required": true,
+                "placeholder": "例如：雨夜的旧城区小巷，尽头有一盏灯"
+              },
+              {
+                "key": "aspectRatio",
+                "type": "select",
+                "label": "画面比例",
+                "required": false,
+                "defaultValue": "16:9",
+                "options": [
+                  { "value": "16:9", "label": "横屏 16:9" },
+                  { "value": "4:3", "label": "横版 4:3" },
+                  { "value": "1:1", "label": "方形 1:1" }
+                ]
+              }
+            ],
+            "mediaSlots": []
+          },
+          "local": {
+            "promptPrefix": "写实场景摄影，电影感构图，体积光，",
+            "promptSuffix": "，层次丰富，高清",
+            "negative": "卡通, 低质量, 模糊, 过曝, 水印",
+            "size": "1536x1024",
+            "sizeByRatio": {
+              "16:9": "1536x1024",
+              "4:3": "1536x1024",
+              "1:1": "1024x1024"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

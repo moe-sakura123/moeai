@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>我的作品 · 蜜丝AI</title>
+  <link rel="stylesheet" href="/app/css/app.css">
+  <script src="/app/js/core/guard.js"></script>
+  <script src="/app/js/core/api.js"></script>
+  <script src="/app/js/core/store.js"></script>
+  <script src="/app/js/core/ui.js"></script>
+</head>
+<body>
+<div id="topbar"></div>
+
+<div class="page-wrap">
+  <div class="page-head">
+    <div>
+      <h1>我的作品</h1>
+      <p>管理你创建的角色：继续编辑、进聊天或查看发布状态</p>
+    </div>
+    <div class="row">
+      <input class="input" id="kw" placeholder="搜索作品名称、简介、标签" style="width:240px">
+      <a class="btn primary" href="/app/creation">新建作品</a>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-bottom:16px">
+    <div class="panel-body tight row between">
+      <div class="tabs" id="filters">
+        <button class="active" data-status="">全部</button>
+        <button data-status="draft">未发布</button>
+        <button data-status="published">已发布</button>
+        <button data-status="scheduled">定时发布</button>
+      </div>
+      <span class="tiny muted" id="count">—</span>
+    </div>
+  </div>
+
+  <div id="grid" class="works-grid"></div>
+</div>
+
+<script src="/app/js/pages/works.js"></script>
+</body>
+</html>
