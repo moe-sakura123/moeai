@@ -1,7 +1,7 @@
 """API 控制器：一次对话请求的编排。
 
 它只按顺序调度各层，不写任何正则、提示词拼装或存储细节：
-  载入上下文 → PromptBuilder 拼 messages → LLM 流式产出
+  载入上下文 → 宿主注入的提示词组装 → LLM 流式产出
   → 清洗 / 补齐格式 → post_processor 拆展示态 → 落库 → 推增量帧
 
 数据库、模型客户端、SSE 通道都由 server 以端口（ChatPorts）注入，
@@ -13,7 +13,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterator, List, Optional
 
-from prompt_builder import PromptBuilder
 from roleplay_core.models import ChatContext
 from roleplay_core.post_processor import parse_status, status_dict
 from roleplay_core.sanitizer import (normalize_say_blocks, stream_hold_start,
@@ -25,6 +24,11 @@ FLUSH_CHARS = 30
 FLUSH_SECONDS = 0.15
 
 ABORT_ERRORS = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
+
+# 已下发内容不到这个字数、且错误可重试时，允许清屏后整段重来一次；
+# 超过 2000 字就保留半截，避免用户已经读了大段再被清空。
+STREAM_ROLLBACK_CHARS = 2000
+STREAM_ROLLBACK_TRIES = 1
 
 
 @dataclass
@@ -81,9 +85,9 @@ class ChatPorts:
     save_assistant: Callable[[ChatContext, str, str], int]
     emit: Callable[[Dict], bool]          # 发一帧；返回 False 表示客户端已断开
     local_reply: Callable[[ChatRequest], str]
-    prepare_messages: Optional[Callable[[ChatContext, List[dict]], List[dict]]] = None
-    worldbook_match: Optional[Callable[[str, str], str]] = None
+    build_messages: Optional[Callable[[ChatContext], List[dict]]] = None
     ensure_format: Optional[Callable[[ChatContext, List[dict], str], str]] = None
+    cancelled: Optional[Callable[[], bool]] = None   # 用户点停止 → 停止读上游、跳过补全
 
 
 class ChatRouter:
@@ -94,38 +98,10 @@ class ChatRouter:
         self._last_status = ()
 
     # ------------------------------------------------------------ 组装
-    @staticmethod
-    def build_messages(ctx: ChatContext,
-                       worldbook_match: Optional[Callable[[str, str], str]] = None,
-                       prepare: Optional[Callable[[List[dict]], List[dict]]] = None,
-                       ) -> List[dict]:
-        """PromptBuilder 拼 messages；世界书匹配由调用方注入（核心层不碰 DB）。"""
-        builder = PromptBuilder(
-            character=ctx.character,
-            prompt_data=ctx.prompt_data,
-            cg_data=ctx.cg_data,
-            name=ctx.character_name,
-            has_payload=ctx.has_payload,
-            current_stats=ctx.current_status.get("values") or {},
-            db_rules_list=ctx.stat_rules,
-        )
-        matcher = None
-        if worldbook_match:
-            cid = ctx.character_id
-            matcher = lambda text: worldbook_match(cid, text)
-        messages = builder.build(ctx.llm_history(), ctx.user_input,
-                                 worldbook_matcher=matcher,
-                                 current_status=ctx.current_status)
-        if prepare:
-            messages = prepare(messages) or messages
-        return messages
-
     def _messages(self, ctx: ChatContext) -> List[dict]:
-        p = self.ports
-        prepare = None
-        if p.prepare_messages:
-            prepare = lambda msgs: p.prepare_messages(ctx, msgs)
-        return self.build_messages(ctx, p.worldbook_match, prepare)
+        if not self.ports.build_messages:
+            raise RuntimeError("ChatPorts 缺少 build_messages")
+        return self.ports.build_messages(ctx)
 
     # ------------------------------------------------------------ 主流程
     def chat_stream(self, request: ChatRequest) -> ChatTurn:
@@ -147,6 +123,10 @@ class ChatRouter:
 
         final = wrap_next_prompts(normalize_say_blocks(raw))
         if not final.strip():
+            if abort == "cancelled":
+                # 用户停止且一个字都没生成 → 不落 assistant、不计费
+                return ChatTurn(ok=True, src=src, user_id=request.user_message_id,
+                                aborted=True)
             if request.fail_on_empty:
                 return ChatTurn(ok=False, src=src, error="模型没有返回内容",
                                 user_id=request.user_message_id)
@@ -192,18 +172,36 @@ class ChatRouter:
         """把 LLM 流按边界攒帧下发。返回 (raw, src, sent, abort, error)。"""
         raw, sent, src = "", 0, request.src
         last_flush = time.time()
+        rolls = 0
         stream = self.ports.stream_llm(messages)
         while True:
+            if self.ports.cancelled and self.ports.cancelled():
+                return raw, src, sent, "cancelled", ""
             try:
                 piece = next(stream)
             except StopIteration:
+                if self.ports.cancelled and self.ports.cancelled():
+                    return raw, src, sent, "cancelled", ""
                 return raw, src, sent, None, ""
             except ABORT_ERRORS:
                 return raw, "chat-stream-aborted", sent, "client", ""
             except Exception as exc:                     # noqa: BLE001
+                if self.ports.cancelled and self.ports.cancelled():
+                    return raw, src, sent, "cancelled", ""
                 decision = self.ports.on_stream_error(exc, raw, request)
                 if decision.fatal:
                     return raw, decision.src, sent, "fatal", decision.error
+                # <2000 字且可重试：清屏后整段重来一次（仅一次，不叠加重试风暴）
+                if (not decision.text and rolls < STREAM_ROLLBACK_TRIES
+                        and 0 < sent < STREAM_ROLLBACK_CHARS
+                        and getattr(exc, "retryable", False)):
+                    if self.ports.emit({"type": "clear_content"}):
+                        rolls += 1
+                        raw, sent = "", 0
+                        last_flush = time.time()
+                        self._last_status = None
+                        stream = self.ports.stream_llm(messages)
+                        continue
                 src = decision.src
                 if decision.text:
                     raw = decision.text

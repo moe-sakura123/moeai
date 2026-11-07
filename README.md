@@ -4,7 +4,7 @@
 
 - **前端**：唯一前端是**自建原生页** `/app/*`（`html/app/`，10 个页面 + 共享 css/js）；
   原站镜像页面已下线，旧地址统一 **302** 到新页（见「路由架构」），未抓到的资源与接口仍反代线上
-- **后端**：Python，标准库为主（唯一第三方依赖：`roleplay_core` 用的 **pydantic**）—— 九段路由分发 + 本地接管 + 反代兜底
+- **后端**：Python，标准库为主（第三方依赖只有 `roleplay_core` 的 **pydantic** 与传输层的 **httpx**）—— 九段路由分发 + 本地接管 + 反代兜底
 - **数据库**：
   - `data/missai.db` —— 本地账号会话、访问与操作日志、收藏、对话、上传记录，
     以及**内容库**（`works` 卡片文字 / `work_tags` 标签 / `tag_catalog` 标签字典 / `content_api` 离线载荷）
@@ -31,15 +31,17 @@ missai_local/
 ├── server.py                  本地服务器（九段路由 + 反代 + 本地接管）
 ├── captcha.py                 数字加减法验证码（出题 / PNG 题图 / 判分）
 ├── db.py                      主库数据层（missai.db）
-├── llm.py                     OpenAI 协议对接（/models 检测 + /chat/completions 对话）
+├── llm.py                     OpenAI 协议传输层（httpx）/models 检测 + /chat/completions 对话（三段超时 + 错误分类重试 + SSE 分帧）
 ├── imagegen.py                绘图协议对接（/models 检测 + /images/generations 文生图 + 本地占位图）
 ├── mediagen.py                绘图配方引擎（内置模板目录 data/json/ + 提示词构建）
 ├── imagedb.py                 图片库数据层（image.db：图片 → 相对路径，绝对路径运行时拼接）
 ├── tplimport.py               第三方模板 JSON 通用适配（行业格式 → MediaGen 配方）
-├── prompt_builder.py          带 Token 预算的 Prompt 组装器（系统提示分层 / 历史滑窗 / 世界书注入）
+├── prompt_builder.py          Token 估算与分段工具（粗估 + EMA 校准 / sectionize / 前缀 hash），供 prompt.py 与 server.py 调用
 ├── roleplay_core/             角色扮演分层核心：聊天生成管线（模型层 + 数值规则 + 清洗 + 输出后处理）
 │   ├── __init__.py            导出 ChatContext / Message
 │   ├── models.py              强类型数据模型（Message / ChatContext，基于 pydantic）
+│   ├── prompt.py              唯一提示词拼装引擎（分区预算 / 世界书 / 角色卡 / 记忆槽 / 三层压缩）
+│   ├── memory_engine.py       算法记忆（特征哈希向量 + FTS5/BM25 + 余弦 / MMR 重排 / 规则抽取）
 │   ├── chat_router.py         单次对话请求编排（上下文 → 拼装 → LLM 流式 → 清洗 → 展示态 → 落库）
 │   ├── emotion_mapper.py      数值规则匹配器（把好感度 / SAN 等数值翻译成情绪 / 行为约束）
 │   ├── sanitizer.py           文本清洗层（<say> 归一、标签剥离、脚本过滤；纯字符串无依赖）
@@ -47,7 +49,7 @@ missai_local/
 ├── selftest.py                冒烟测试（227 项：离线兜底、对话设置、模型接入、AI 绘图、流式聊天 …）
 ├── tools/
 │   └── mirror.py              镜像脚本（重建静态镜像 / 手动镜像落库 / 创意广场同步）
-├── tests/                     专项测试（stub_llm.py 模型桩 + test_cg_* / test_chat_local）
+├── tests/                     专项测试（stub_llm.py 模型桩 + test_cg_* / test_chat_local / test_chat_regression）
 ├── data/
 │   ├── missai.db              主库（首次启动自动创建）
 │   ├── image.db               图片库（首次启动自动创建）
@@ -56,15 +58,17 @@ missai_local/
 │   │                          san_rules.json（SAN 值 0~100）
 │   └── .current_db            控制台切换数据库后记录当前库路径
 ├── logs/                      运行期日志（如 tests/stub_llm 的捕获日志）
-├── start.bat                  Windows 一键启动
+├── requirements.txt           第三方依赖（httpx）
+├── start.bat                  Windows 一键启动（缺 httpx 时先装依赖，装不上直接退出）
 └── README.md
 ```
 
-`roleplay_core/` + `prompt_builder.py` 是后加的**聊天生成管线**：`server.py` 只做 HTTP 编排，
+`roleplay_core/` 是**聊天生成管线**：`server.py` 只做 HTTP 编排，
 把一次对话交给 `roleplay_core/chat_router.py`（`ChatPorts` 注入 db / 模型 / SSE），按
-**上下文 → PromptBuilder 拼 messages → LLM 流式 → sanitizer 清洗 → post_processor 拆展示态 → 落库**
-走完。好感度 / SAN 数值规则落在 `data/rules/*.json`，由 `emotion_mapper` 匹配档位后注入提示词。
-该层引入了全项目唯一的第三方依赖 **pydantic**（`roleplay_core/models.py`）。
+**上下文 → prompt.py 拼 messages → LLM 流式 → sanitizer 清洗 → post_processor 拆展示态 → 落库**
+走完。提示词组装只有一个引擎 `roleplay_core/prompt.py`（`prompt_builder.py` 只提供 token 估算与分段工具）。
+好感度 / SAN 数值规则落在 `data/rules/*.json`，由 `emotion_mapper` 匹配档位后注入提示词。
+第三方依赖是 **pydantic**（`roleplay_core/models.py`）与 **httpx**（`llm.py` 传输层）。
 
 ## 运行
 
@@ -162,7 +166,14 @@ python selftest.py 4173   # 227 项，全绿输出「通过 227，失败 0」
 | `checkin_records` | **每日签到**：`user_id + date` 唯一，记当天拿到的积分（重复签到不重复加分） |
 | `request_log` | 每次请求的方法/路径/状态/耗时/用户/IP/体积/备注 |
 | `favorites` | 本地收藏、点赞、关注（嗅探 `favorite/like/follow` 类请求） |
-| `chat_threads` / `chat_messages` | 本地对话记录（用户消息入库，AI 流式回复解析后入库） |
+| `chat_threads` / `chat_messages` | 本地对话记录（用户消息入库，AI 流式回复解析后入库；`content_llm` 存清洗后纯文本供下一轮拼 prompt） |
+| `chat_memories` | 旧记忆摘要表，**只读兼容**（新流程不再写新行） |
+| `chat_summary_state` | 滚动摘要游标：`covered_until` / `covered_count` / `rolling_summary` / `turns_since_update`，按会话隔离 |
+| `chat_memory_slots` | 记忆四槽：`promise`（承诺与待办）/ `user_info` / `long_term` / `short_term`，`session_id + slot` 唯一 |
+| `chat_memory_items` | 算法记忆条目：类型、重要度、置信度、来源消息、去重 hash、合并/聚类状态 |
+| `chat_memory_vectors` | 记忆向量，按 `memory_id + model` 存；`hash` 基线向量始终有，`openai` 向量可补算 |
+| `chat_memory_recall_log` | 每轮召回日志：命中的记忆、排名、注入位置、打分明细 |
+| `chat_prompt_log` | 每次聊天前的完整 prompt 快照：messages / 实际请求 / `turn_id` / `finish_reason` / 分段 token / 前缀 hash / 世界书 / 记忆槽 / 与上一轮的分段 diff |
 | `uploads` | 上传记录：本地路径、SHA256、字节数（图片本体的登记在 `image.db`） |
 | `works` | **内容库**：卡片文字 —— 名称、简介、作者、评分、封面、标签 JSON、原始条目 |
 | `work_tags` | 作品 ↔ 标签（一行一个标签，控制台的标签统计、离线标签筛选都读它） |
@@ -252,6 +263,7 @@ python selftest.py 4173   # 227 项，全绿输出「通过 227，失败 0」
 | GET | `/local/api/db/tables` | 表列表（行数 / 列数） |
 | GET | `/local/api/db/table?name=&limit=&offset=` | 表数据 + 列信息（含 `pk`） |
 | GET | `/local/api/db/logs?limit=&offset=` | 操作日志 |
+| GET | `/local/api/prompt-logs?userId=&sessionId=&limit=` | 最近的 prompt 快照（messages / 实际请求 / 分段 token / 前缀 hash / 与上一轮 diff），只读 |
 | POST | `/local/api/db/row/save` | 新增 / 更新记录（`table`、`values`、可选 `pk`） |
 | POST | `/local/api/db/row/delete` | 删除记录（`table`、`pk`） |
 | POST | `/local/api/db/table/create` | 建表（`name`、`columns`） |
@@ -563,16 +575,18 @@ python selftest.py 4173   # 227 项，全绿输出「通过 227，失败 0」
 | `update` / `updateTitle` | 改会话标题（历史对话里重命名），返回 `_thread_view` 形状 |
 | `deleteMessage` / `editMessage` | 删一条 / 改一条消息，作用域 `thread_id IN (SELECT id FROM chat_threads WHERE user_id IS ?)`；删除后重算 `message_count` |
 | `delete` | 删整个会话（连带 `chat_messages`） |
-| `summaries` / `summary` | 本地不做记忆摘要：恒回空列表 / `summary:""` |
+| `summaries` / `summary` | 记忆摘要**不在前端同步**：恒回空列表 / `summary:""`；滚动摘要由生成管线内部维护在 `chat_summary_state`，每轮按槽位注入，不再单独下发给页面 |
 | `stopStatus` / `resumeStream` | 本地没有在跑的流：恒 `status:"idle"`、`synced:true` |
 | `chatSync` | **输入栏切到「非流式」走这里**：真调模型，回 `{"assistantMessageId":…,"userMessageId":…,"message":…,"pointsConsumed":0,"stoppedByUser":false}`（原来和续传一起当 idle 桩，前端直接显示 `[ERROR]非流式聊天失败，请稍后重试。`） |
-| `chatStream` | **真流式** `text/event-stream`：`{"type":"content"}` 逐段 → `{"type":"usage"}` → `{"type":"done", assistantMessageId, userMessageId}` → `data: [DONE]`；`assistantMessageId` 是数字，用户这条与完整回复都落库 |
+| `chatStream` | **真流式** `text/event-stream`：`{"type":"content"}` 逐段 → `{"type":"usage"}` → `{"type":"done", assistantMessageId, userMessageId, upstreamUsage}` → `data: [DONE]`；`assistantMessageId` 是数字，用户这条与完整回复都落库 |
 | `guestChat/chatStream` | 试玩流走另一套协议：单帧 `{"type":"message","content":完整回复}` + `guest_info_updated` + `done`（前端只认 `message` 这个类型） |
 | `claimGuest` | 回 `status:"ready"`、`sessionId` 是**会话行 id 的十进制字符串**、`sourceSessionId` / `identityScope` 是 UUID 形状（`identityScope ≥ 16` 字符） |
 | `userHistory` | 游玩历史（`data.list` + 整数 `data.total`） |
 | `resolve` / `state` / `partialContent` | 已解析 / 永远 `idle` / 空内容（处理中才需要续传，本地恒空闲） |
-| `modelConfig/getByModelRate`、`saveByModelRate` | **对话设置的模型参数**（温度 / Top_P / 惩罚 / 最大长度）；按 `用户:modelRateId` 存 `config_cache`，默认值 `0.7 / 1.0 / 0 / 0 / 2048` |
-| `summaryConfig/getByCharacter`、`saveByCharacter` | **对话设置的记忆配置**（记忆轮数 / 增强记忆）；按 `用户:characterID` 存 `config_cache` |
+| `modelConfig/getByModelRate`、`saveByModelRate` | **对话设置的模型参数**（温度 / Top_P / 惩罚 / 最大长度 / 上下文窗口）；按 `modelConfig:{用户}:{modelRateId}` 存 `config_cache`，默认 `0.7 / 0.8 / 0 / 0 / 8192 / 8192` |
+| `promptConfig/getByCharacter`、`saveByCharacter` | **提示词与记忆参数**：锚点（enabled / depth / frequency / text）+ 记忆权重与检索配置；按 `promptEngine:{用户}:{characterID}` 存 `config_cache` |
+| `embeddingConfig/get`、`save`、`backfill` | **检索向量配置**：OpenAI 兼容 `base_url` / `api_key` / `model` / `dimensions` / 批量与超时；用户级优先、空则回落全局 `embeddingConfig:0`，`backfill` 后台补齐向量 |
+| `summaryConfig/getByCharacter`、`saveByCharacter` | **摘要参数**：开关 / 注入方式 / 保留轮数；按 `summaryConfig:{用户}:{characterID}` 存 `config_cache` |
 
 > 这两组 GET 原本会被反代到线上 → 线上不认本地会话回 401 → 降级成 `data:{}`，
 > 前端拿到 `{}` 后直接 `value.toFixed()`，**「对话设置」一打开就报
@@ -586,7 +600,7 @@ python selftest.py 4173   # 227 项，全绿输出「通过 227，失败 0」
   走 OpenAI 协议（见下一章「模型接入」），没配模型或调用失败才落到本地生成，
   刷新页面依然能读回。
 
-**聊天生成管线（`roleplay_core/` + `prompt_builder.py`）**
+**聊天生成管线（`roleplay_core/`）**
 
 `server.py` 只做 HTTP 编排：把一次对话封装成 `ChatRequest`（session / character / user_input /
 AICG 开关 / 来源 `src` / 是否允许本地兜底）后交给 `ChatRouter(ports).chat_stream()`；
@@ -596,29 +610,46 @@ server**（避免循环依赖）。一次对话按固定顺序走：
 1. **载入上下文**（`load_context` → `_chat_context`）：组 `ChatContext`（角色整包、历史、
    用户输入、AICG 开关、当前状态数值、平台数值规则 `stat_rules`/`stat_meta`、
    角色卡属性 schema `stats_schema`）。
-2. **拼 messages**（`ChatRouter.build_messages` → `PromptBuilder`）：
+2. **拼 messages**（`ChatRouter.build_messages` → `roleplay_core/prompt.py`，唯一引擎）：
+   - **分区装配**：persona / identity / character_extra / examples / worldbook_before /
+     memory / status / worldbook_after / format 各成一段 system，每段有预算比例与优先级；
    - system **前缀每轮固定**（人设 → 身份/世界观/风格 → CG 目录 → 剧情选项 → 破甲词 →
      强制格式规范），同一角色多轮稳定、可命中上游 prefix cache；
-   - 历史按 **Token 预算滑窗**裁剪（`HISTORY_TOKEN_BUDGET=2000`，`tiktoken` 懒加载、
-     装不上退回字符估算），从最新往前装、超预算的最旧消息直接丢弃；
-   - **世界书**（按语境匹配，匹配器由调用方注入）与**状态面板**（当前数值 + 档位表现 +
-     状态变化规则）各成一条 system 消息，插在历史之后；
-   - 当前用户消息末尾贴**格式提醒**（离生成最近，防漏状态栏/选项）；
-   - 之后 `prepare_messages` 注入输入栏「自定」的自定义设定（按位置/关键词）与记忆区自动摘要。
-3. **LLM 流式产出**（`stream_llm`）：OpenAI `stream:true`，逐行解析
-   `choices[0].delta.content`，前端边收边渲染（原先是等全量生成完再一次性回 JSON，
-   qwen 这档本地推理要 79 秒，看起来像卡死）；上游无视 `stream` 直接回整包也照样能解析。
-4. **攒帧下发**：按 **30 字 / 150ms** 攒够再发一帧 `content`（上游常 1~5 字推一条，
+   - **token 估算**：`prompt_builder.count_tokens` 粗估（CJK 1.5 / 其他 0.25 / 每条 4），
+     按 `host::model` 用上游 `usage` 做 EMA 自校准，预算 = `contextWindow - 输出预算 - 64`；
+   - **世界书**：按关键词/常量匹配，`priority` 决定预算淘汰顺序、`order` 只决定注入位置
+     （固定前缀 / 历史之后 / 历史内部 depth），`ignore_on_max_context` 直接降到最低优先级；
+   - **记忆**：四槽 `promise` / `user_info` / `long_term` / `short_term`（各自预算与深度）+
+     `memory_engine` 混合检索（FTS5 优先，失败回落纯 Python BM25；向量用特征哈希 384 维兜底，
+     配了 OpenAI embedding 就换到对应模型空间），按重要度 / 时效 / 余弦 / MMR 重排后注入；
+   - **状态面板**（当前数值 + 档位表现 + 状态变化规则）与当前用户消息末尾的**格式提醒**
+     （离生成最近，防漏状态栏/选项）保持独立分段。
+3. **三层压缩**（超预算时逐层退让）：
+   - **发送前确定性裁剪**（`compress_for_budget`）：按 世界书前置 → 后置 → depth → few-shot →
+     最旧历史 的顺序丢弃，最近 `COMPRESS_KEEP_ROUNDS=6` 轮（12 条）原文永不压，上限 24 轮；
+   - **异步压缩**：被裁掉的历史进单线程后台队列（按 `(uid, sid, cid)` 去重），由默认模型并进
+     `chat_summary_state.rolling_summary` / 记忆槽与算法记忆，**下一轮生效**；
+   - **同步兜底**：上游仍报 `context_overflow` 时只重试一次；摘要成功但没减量就补
+     `shrink_for_overflow(level=3, keep=12)`，失败则回退确定性裁剪，均不阻断本轮回复。
+   每次压缩都记 `before / after / 区间 / 摘要 id`（`request_log` + `chat_prompt_log`）。
+4. **LLM 流式产出**（`stream_llm`）：OpenAI `stream:true`，逐行解析
+   `choices[0].delta.content`，前端边收边渲染；上游无视 `stream` 直接回整包也照样能解析。
+5. **攒帧下发**：按 **30 字 / 150ms** 攒够再发一帧 `content`（上游常 1~5 字推一条，
    直接转发会让前端每秒重绘几十次）；状态栏一闭合就单独推 `status_update` 帧
    （前端只更新胶囊、不重绘正文）。
-5. **收尾清洗**：`stream_hold_start()` 先刷掉攒住的半行 → `wrap_next_prompts()` +
+6. **收尾清洗**：`stream_hold_start()` 先刷掉攒住的半行 → `wrap_next_prompts()` +
    `normalize_say_blocks()` 统一改写；模型空回复且不允许兜底 → 报错收尾、不落库；
    漏状态栏/选项由 `ensure_format` 再补一次 LLM 调用（用户中断不补）。
-6. **后处理成展示态**（`process_output`）：`<image>ID</image>` → 真实 URL（编造 ID 抹掉）、
+7. **后处理成展示态**（`process_output`）：`<image>ID</image>` → 真实 URL（编造 ID 抹掉）、
    没点图按权重兜底补一张、图片统一置顶；`<book_status>` → status 数组、`<next_prompt>`
    → options；`display_text` 去标签（前端用结构化数据重建 DOM），`tagged_text` 保留标签落库。
-7. **落库**（`save_assistant`）：`tagged_text` 写 `content` 列（渲染用）、`clean_for_storage()`
-   清洗成纯文本写 `content_llm` 列（下一轮拼 prompt 直接读它，不再现算）；后台线程跑记忆摘要。
+8. **落库**（`save_assistant`）：`tagged_text` 写 `content` 列（渲染用）、`clean_for_storage()`
+   清洗成纯文本写 `content_llm` 列（下一轮拼 prompt 直接读它，不再现算）；有淘汰历史时
+   `_enqueue_compress` 投递后台压缩任务。
+
+**流式回滚**：已下发不足 `STREAM_ROLLBACK_CHARS=2000` 字、且错误标了 `retryable` 时，
+`ChatRouter` 先发 `clear_content` 清屏、重置缓冲并重开上游一次；超过 2000 字只保留已发部分，
+绝不中途换成本地回复。
 
 **收尾改写重画**：若改写越过已下发的半截内容（`display_text` 不以已发部分开头），
 `ChatRouter` 先发 `clear_content` 让前端清屏、再按最终文本重画，避免
@@ -675,10 +706,21 @@ server**（避免循环依赖）。一次对话按固定顺序走：
 
 **请求怎么走**
 
-- `llm.py`（纯标准库）只有两条请求，全按 OpenAI 官方协议：
+- `llm.py`（`httpx` 同步传输）只有两条请求，全按 OpenAI 官方协议：
   `GET {base_url}/models`（检测 + 拉模型）、`POST {base_url}/chat/completions`（对话）。
   地址没写 `/v1` 而上游 404 时自动补一次 `/v1` 重试；连不上/上游报错统一抛 `LLMError`，
   原文直接显示在控制台。
+- **三段超时**（流式与非流式同一套语义）：
+  | 阶段 | 上限 | 说明 |
+  |---|---|---|
+  | 连接 | `CONNECT_TIMEOUT=10s` | 含连接池等待（`pool`）与写请求超时 |
+  | 首字节 | `FIRST_BYTE_TIMEOUT=30s` / `FIRST_BYTE_TIMEOUT_STREAM=60s` | 从发出请求到收到首个响应体字节/首个 SSE 帧；由 watchdog 关闭响应解除阻塞读 |
+  | 空闲 | `IDLE_TIMEOUT=120s` | 首字节之后，任意两个数据块之间 |
+- 错误分类保持不变：`LLMError(status, code, retryable, retry_after)`，HTTP 4xx/5xx 读上游
+  错误详情并识别 `context_overflow`、解析 `Retry-After`（封顶 30s）；流内 `ReadError` 记
+  `stream_broken`，首帧后读超时记 `idle_timeout`。首帧前按状态码/超时重试，总尝试
+  `MAX_ATTEMPTS=4`（1/2/4s 退避 + 抖动），已吐内容后不再重试。
+- SSE 按空行分帧、多行 `data:` 拼接、忽略注释心跳，`[DONE]` 正常收尾。
 - 控制台接口（仅管理员，回包**不带明文密钥**，只有 `apiKeySet` / `apiKeyMasked`，
   表单里密钥留空表示不改）：
 
@@ -712,8 +754,9 @@ server**（避免循环依赖）。一次对话按固定顺序走：
 - 调用失败由 `_decide_stream_error` 决定：已吐过内容 → 保留已发部分、**绝不中途换本地**；
   允许回退（`fb`）→ 降级成本地兜底，对话不会断；否则 `fatal` 报错收尾、不落库，
   提示可在控制台「模型接入」开启超时回退；
-- messages 由 `PromptBuilder` 组装：system 前缀（人设/世界观/风格/CG/选项/格式）+
-  **Token 预算内历史**（不再固定「最近 24 条」）+ 世界书 + 状态面板 + 当前用户消息；
+- messages 由 `roleplay_core/prompt.py` 组装：分区 system 前缀（人设/世界观/风格/CG/选项/格式）+
+  **预算内历史**（token 粗估 + EMA 校准，最近 6 轮原文不动）+ 世界书 + 记忆四槽 + 状态面板 +
+  当前用户消息；
 - 日志 `request_log.note` 会记 `chat-llm:模型名` / `chat-llm-failed` / `chat-local`，便于回查。
 
 **日后加平台预设**：`db.LLM_PRESETS` 加一行即可（协议都是 OpenAI 兼容），

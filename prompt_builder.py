@@ -1,22 +1,28 @@
-"""带 Token 预算的 Prompt 组装器（借鉴 RisuAI sendChat 流水线）。
+"""提示词组装的共享组件。
 
-把 server.Handler._llm_messages 里「拼提示词」的部分独立出来：
-系统提示词分层拼装 → 历史按 Token 预算滑窗裁剪 → 世界书注入 → 格式规范收尾。
-
-注意：chat_history 里的 assistant 内容应已是落库时的纯文本（content_llm 列），
-本模块不再做标签清洗。
+roleplay_core/prompt.py 是唯一拼装引擎；本模块只提供它复用的
+token 估算、分区统计、固定前缀 hash，以及角色卡 CG / 状态面板片段。
+整段消息顺序、历史滑窗与预算分配都由它负责。
 """
 from __future__ import annotations
 
-import sys
-from typing import Callable, Dict, Iterable, List, Optional
+import hashlib
+import math
+from typing import Dict, Iterable, List, Optional
 
 from roleplay_core.emotion_mapper import EmotionMapper
 from roleplay_core.sanitizer import clean_description_html
 
-ENCODER_NAME = "cl100k_base"
-# 历史滑窗预算（只算对话历史，不含 system / 当前消息 / 世界书）
-HISTORY_TOKEN_BUDGET = 2000
+# 零依赖粗估：CJK 1.5 token/字，其他 0.25 token/字，每条消息再算 4 个结构开销。
+# 真实用量由 usage.prompt_tokens 反向校准（α 存在 server.py，按 provider+model 分键）。
+TOKEN_CJK_RATIO = 1.5
+TOKEN_OTHER_RATIO = 0.25
+TOKEN_MSG_OVERHEAD = 4
+TOKEN_ALPHA_DEFAULT = 1.0
+TOKEN_ALPHA_MIN = 0.75
+TOKEN_ALPHA_MAX = 1.6
+
+_ALPHA = TOKEN_ALPHA_DEFAULT
 
 # 剧情选项·系统默认模板：promptData.postPrompt 为空（自定义开关关闭）时使用
 NEXT_PROMPT_DEFAULT = (
@@ -60,22 +66,46 @@ FORMAT_REMINDER = (
     "缺少状态栏或选项视为不合格回复。）"
 )
 
-_ENCODER = None
-_ENCODER_READY = False
+
+def set_token_alpha(alpha) -> None:
+    """注入当前 provider+model 的校准系数（夹在 [0.75, 1.6]）。"""
+    global _ALPHA
+    try:
+        val = float(alpha)
+    except (TypeError, ValueError):
+        val = TOKEN_ALPHA_DEFAULT
+    if val <= 0:
+        val = TOKEN_ALPHA_DEFAULT
+    _ALPHA = min(TOKEN_ALPHA_MAX, max(TOKEN_ALPHA_MIN, val))
 
 
-def _get_encoder():
-    """懒加载 tiktoken 编码器；装不上时返回 None（退回字符估算）。"""
-    global _ENCODER, _ENCODER_READY
-    if not _ENCODER_READY:
-        _ENCODER_READY = True
-        try:
-            import tiktoken
-            _ENCODER = tiktoken.get_encoding(ENCODER_NAME)
-        except Exception as exc:                       # noqa: BLE001
-            print(f"[prompt] tiktoken 不可用，退回字符估算：{exc}", file=sys.stderr)
-            _ENCODER = None
-    return _ENCODER
+def get_token_alpha() -> float:
+    return _ALPHA
+
+
+def _raw_tokens(text) -> float:
+    """1.5×CJK + 0.25×其他（CJK 取 0x4E00–0x9FFF）。"""
+    cjk = other = 0
+    for ch in str(text or ""):
+        if "\u4e00" <= ch <= "\u9fff":
+            cjk += 1
+        else:
+            other += 1
+    return cjk * TOKEN_CJK_RATIO + other * TOKEN_OTHER_RATIO
+
+
+def count_tokens(text: str) -> int:
+    """与 PromptBuilder 相同的 token 估算口径（供 prompt 日志 / 回归统计复用）。"""
+    return int(math.ceil(_raw_tokens(text) * _ALPHA))
+
+
+def estimate_messages(messages: Iterable[Dict], alpha: float | None = None) -> int:
+    """整段 messages 的 token 估算：正文 × α + 4/消息（供 max_tokens 预算）。"""
+    msgs = list(messages or [])
+    a = _ALPHA if alpha is None else float(alpha)
+    raw = sum(_raw_tokens((m or {}).get("content") if isinstance(m, dict) else m)
+              for m in msgs)
+    return int(math.ceil(raw * a + TOKEN_MSG_OVERHEAD * len(msgs)))
 
 
 def _cg_words(v) -> List[str]:
@@ -87,15 +117,71 @@ def _cg_words(v) -> List[str]:
     return []
 
 
+def sectionize(messages: Iterable[Dict]) -> List[Dict]:
+    """把最终 messages 按 section 打标并统计 token（阶段 0 的对照基线）。
+
+    id 只用于日志定位，不改变发送内容：persona / worldbook / status /
+    history.* / current。hash 可用于跨轮比较固定前缀是否漂移。
+    """
+    msgs = list(messages or [])
+    last_user = -1
+    for i, m in enumerate(msgs):
+        if (m or {}).get("role") == "user":
+            last_user = i
+    out: List[Dict] = []
+    for i, m in enumerate(msgs):
+        role = str((m or {}).get("role") or "")
+        content = str((m or {}).get("content") or "")
+        if role == "system":
+            if "### 世界书" in content:
+                sid = "worldbook"
+            elif "### 当前状态面板" in content:
+                sid = "status"
+            elif i == 0:
+                sid = "persona"
+            else:
+                sid = f"system.{i}"
+        elif i == last_user:
+            sid = "current"
+        elif role == "assistant":
+            sid = "history.assistant"
+        else:
+            sid = "history.user"
+        out.append({
+            "id": sid, "role": role, "index": i,
+            "tokens": count_tokens(content),
+            "hash": hashlib.sha1(content.encode("utf-8")).hexdigest()[:12],
+        })
+    return out
+
+
+def prompt_prefix_hash(messages: Iterable[Dict]) -> str:
+    """固定前缀 hash：拿第一条 system（角色核心设定/格式规范）做对照。"""
+    msgs = list(messages or [])
+    if not msgs:
+        return ""
+    first = msgs[0] if isinstance(msgs[0], dict) else {}
+    if first.get("role") != "system":
+        return ""
+    return hashlib.sha1(str(first.get("content") or "").encode("utf-8")).hexdigest()[:16]
+
+
+def section_tokens(messages: Iterable[Dict]) -> Dict[str, int]:
+    """按 section 汇总 token（同 id 多段合并）。"""
+    total: Dict[str, int] = {}
+    for sec in sectionize(messages):
+        total[sec["id"]] = total.get(sec["id"], 0) + int(sec["tokens"])
+    return total
+
+
 class PromptBuilder:
-    """按 Token 预算组装最终发给 LLM 的 messages。"""
+    """角色卡固定片段（CG 目录 / 状态面板）的构建器，供前缀与状态段复用。"""
 
     def __init__(self, character: Optional[Dict] = None,
                  prompt_data: Optional[Dict] = None,
                  cg_data: Optional[Dict] = None, *,
                  name: str = "角色",
                  has_payload: bool = True,
-                 history_budget: int = HISTORY_TOKEN_BUDGET,
                  current_stats: Optional[Dict] = None,
                  db_rules_list=None):
         self.character = character or {}
@@ -103,37 +189,13 @@ class PromptBuilder:
         self.cg_data = cg_data or {}
         self.name = name
         self.has_payload = has_payload
-        self.history_budget = max(0, int(history_budget or 0))
         # 当前状态数值 + 平台数值规则：构建时注入，档位匹配在这里一次性完成
         self.current_stats = dict(current_stats) if isinstance(current_stats, dict) else {}
         self.emotion_mapper = EmotionMapper(db_rules_list or {})
 
     # ---------------------------------------------------------- token 计数
     def _count_tokens(self, text: str) -> int:
-        text = str(text or "")
-        enc = _get_encoder()
-        if enc is not None:
-            return len(enc.encode(text))
-        return len(text)          # 退化估算：中文约 1 字 1 token
-
-    def _trim_history(self, chat_history: Iterable[Dict]) -> List[Dict]:
-        """从最新往前装，装不下的更早消息直接丢弃（滑动窗口）。"""
-        kept: List[Dict] = []
-        used = 0
-        for msg in reversed(list(chat_history or [])):
-            content = str(msg.get("content") or "").strip()
-            if not content:
-                continue
-            role = "user" if msg.get("role") == "user" else "assistant"
-            tokens = self._count_tokens(content)
-            if kept and used + tokens > self.history_budget:
-                break
-            # 第一条（最新的）即使超预算也保留，否则本轮就只剩 system
-            kept.insert(0, {"role": role, "content": content})
-            used += tokens
-            if used >= self.history_budget:
-                break
-        return kept
+        return count_tokens(text)
 
     # ---------------------------------------------------------- system
     def _build_cg_catalog(self) -> str:
@@ -161,59 +223,6 @@ class PromptBuilder:
             return ""
         catalog.append(f"示例：`<image>{first_id}</image>`")
         return "\n".join(catalog)
-
-    def _build_system_prompt(self) -> str:
-        """固定前缀：人设 → 身份 / 世界观 / 风格 → CG 目录 → 剧情选项 → 破甲词 → 格式。
-
-        这里不放世界书等每轮变化的内容，保证同一角色多轮对话时前缀稳定、
-        可以直接命中上游的 prefix cache。
-        """
-        prompt = self.prompt_data
-        ch = self.character
-
-        sys_prompt = str(prompt.get("systemPrompt") or "").strip()
-        if not sys_prompt:                       # 主提示词为空 → 退回角色详细介绍
-            sys_prompt = clean_description_html(ch.get("description") or "")
-        ai_identity = str(prompt.get("aiIdentityStylePrompt") or "").strip()
-        world_view = str(prompt.get("worldViewPrompt") or "").strip()
-        style_prompt = str(prompt.get("writingStylePrompt") or "").strip()
-
-        parts: List[str] = []
-        if sys_prompt:
-            parts.append("### 角色核心设定\n" + sys_prompt)
-        # 去重：身份设定已经写在主提示词里就不再重复拼
-        if ai_identity and ai_identity not in sys_prompt:
-            parts.append("### 身份与任务\n" + ai_identity)
-        if world_view:
-            parts.append("### 世界观背景\n" + world_view)
-        if style_prompt:
-            parts.append("### 写作风格要求\n" + style_prompt)
-        catalog = self._build_cg_catalog()
-        if catalog:
-            parts.append(catalog)
-        # 剧情选项：postPrompt 为空（自定义关）→ 用系统默认模板
-        post = (str(prompt.get("postPrompt") or "").strip()
-                or NEXT_PROMPT_DEFAULT)
-        parts.append("### 剧情选项要求\n" + post)
-        # 破甲词：仅自定义填了才拼
-        bk = str(prompt.get("breakArmorWord") or "").strip()
-        if bk:
-            parts.append("### 破甲词\n" + bk)
-
-        system = "\n\n".join(parts)
-        if not self.has_payload:                 # 拿不到角色整包（如镜像角色）→ 通用兜底
-            system = (f"### 角色核心设定\n你是{self.name}，保持这个角色的设定、语气与"
-                      "故事背景，用自然的中文推进对话。\n\n" + system)
-        # 格式规范放在最后（离模型最近），避免被前面的剧情冲淡
-        system += "\n\n" + FORMAT_RULES + "\n\n" + FORMAT_EXAMPLE
-        return system
-
-    def _match_lorebook(self, context: str,
-                        matcher: Optional[Callable[[str], str]]) -> str:
-        """世界书按语境匹配；匹配器由调用方注入（核心层不碰 DB）。"""
-        if not matcher:
-            return ""
-        return str(matcher(context) or "").strip()
 
     def _build_status_panel(self, status: Optional[Dict]) -> str:
         """当前状态面板 + 当前档位表现 + 世界书规则 + 输出格式。
@@ -249,38 +258,3 @@ class PromptBuilder:
                    "并严格按此格式输出所有状态：\n"
                  + f"`<book_status>{sample}</book_status>`")
         return text
-
-    def build(self, chat_history: Iterable[Dict], current_message: str,
-              worldbook_matcher: Optional[Callable[[str], str]] = None,
-              current_status: Optional[Dict] = None) -> List[Dict]:
-        """system 前缀 → 预算内历史 → 世界书(system) → 状态面板(system) → 当前用户消息。
-
-        世界书 / 状态面板单独成 system 消息插在历史之后：前面的角色/格式前缀
-        每轮完全不变，上游可以稳定命中 prefix cache；只有这两段随语境变化。
-        """
-        history = self._trim_history(chat_history)
-
-        tail = None
-        if history and history[-1]["role"] == "user":
-            tail = history.pop()               # 最新一句 user 永远排最后
-        elif str(current_message or "").strip():
-            tail = {"role": "user", "content": str(current_message).strip()}
-
-        ctx = "\n".join([m["content"] for m in history]
-                        + ([tail["content"]] if tail else []))
-        lorebook = self._match_lorebook(ctx, worldbook_matcher)
-
-        messages: List[Dict] = [{"role": "system",
-                                 "content": self._build_system_prompt()}]
-        messages.extend(history)
-        if lorebook:
-            messages.append({"role": "system",
-                             "content": "### 世界书\n" + lorebook})
-        # 状态面板每轮都注入：历史里没有状态，模型只能靠这段知道当前数值
-        messages.append({"role": "system",
-                         "content": self._build_status_panel(current_status)})
-        if tail:
-            # 格式提醒贴在本轮用户消息里：模型最容易漏状态栏/选项，靠最近位置兜住
-            tail["content"] = str(tail["content"]).rstrip() + FORMAT_REMINDER
-            messages.append(tail)
-        return messages

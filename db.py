@@ -26,6 +26,7 @@ import os
 import re
 import secrets
 import sqlite3
+import struct
 import threading
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -234,6 +235,87 @@ def init() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_mem_char ON chat_memories(user_id, character_id, id);
 
+        -- 记忆摘要游标：按会话记录已经总结到的最后一条消息 id / 条数。
+        -- 新会话从 0 开始，不会继承其他会话的进度；删除会话时一起删掉。
+        CREATE TABLE IF NOT EXISTS chat_summary_state (
+            session_id    TEXT PRIMARY KEY,
+            user_id       INTEGER,
+            character_id  TEXT,
+            covered_until INTEGER NOT NULL DEFAULT 0,
+            covered_count INTEGER NOT NULL DEFAULT 0,
+            rolling_summary TEXT NOT NULL DEFAULT '',
+            turns_since_update INTEGER NOT NULL DEFAULT 0,
+            updated_at    TEXT NOT NULL
+        );
+
+        -- 记忆固定槽位：短期 / 长期 / 用户信息 / 承诺，按会话隔离。
+        -- 旧表 chat_memories 继续只读兼容，新流程不再写新行到它。
+        CREATE TABLE IF NOT EXISTS chat_memory_slots (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id       INTEGER,
+            character_id  TEXT,
+            session_id    TEXT,
+            slot          TEXT NOT NULL,
+            content       TEXT NOT NULL,
+            covered_until INTEGER NOT NULL DEFAULT 0,
+            updated_at    TEXT NOT NULL,
+            UNIQUE(session_id, slot)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mem_slot
+            ON chat_memory_slots(user_id, session_id, slot);
+
+        -- 算法记忆：结构化条目 + 向量 + 召回日志。
+        -- FTS5 虚拟表在 init 末尾单独建（旧 SQLite 不支持时自动降级为 Python BM25）。
+        CREATE TABLE IF NOT EXISTS chat_memory_items (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id        INTEGER,
+            character_id   TEXT NOT NULL DEFAULT '',
+            session_id     TEXT NOT NULL DEFAULT '',
+            kind           TEXT NOT NULL DEFAULT 'fact',
+            content        TEXT NOT NULL,
+            subject        TEXT NOT NULL DEFAULT '',
+            object         TEXT NOT NULL DEFAULT '',
+            importance     REAL NOT NULL DEFAULT 0.5,
+            confidence     REAL NOT NULL DEFAULT 0.7,
+            event_time     TEXT NOT NULL DEFAULT '',
+            source_turn    TEXT NOT NULL DEFAULT '',
+            source_msg_ids TEXT NOT NULL DEFAULT '[]',
+            status         TEXT NOT NULL DEFAULT 'active',
+            recall_count   INTEGER NOT NULL DEFAULT 0,
+            last_recalled_at TEXT,
+            merged_into    INTEGER,
+            cluster_id     INTEGER,
+            hash           TEXT NOT NULL DEFAULT '',
+            created_at     TEXT NOT NULL,
+            updated_at     TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mem_item_scope
+            ON chat_memory_items(user_id, character_id, session_id, status, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_mem_item_hash ON chat_memory_items(hash);
+
+        -- 向量按「记忆 × 模型」存：hash 基线向量始终有，openai 向量可补算。
+        CREATE TABLE IF NOT EXISTS chat_memory_vectors (
+            memory_id INTEGER NOT NULL,
+            model     TEXT NOT NULL DEFAULT 'hash',
+            dim       INTEGER NOT NULL,
+            vec       BLOB NOT NULL,
+            PRIMARY KEY(memory_id, model)
+        );
+
+        CREATE TABLE IF NOT EXISTS chat_memory_recall_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER,
+            session_id  TEXT NOT NULL DEFAULT '',
+            turn_id     TEXT NOT NULL DEFAULT '',
+            memory_id   INTEGER NOT NULL,
+            rank        INTEGER NOT NULL DEFAULT 0,
+            injected_at INTEGER NOT NULL DEFAULT 0,
+            score_json  TEXT NOT NULL DEFAULT '{}',
+            created_at  TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mem_recall
+            ON chat_memory_recall_log(user_id, session_id, id DESC);
+
         -- 发给 LLM 的完整 prompt 快照（每次 chatStream 调用前落盘，用于调试/复现/审计）
         CREATE TABLE IF NOT EXISTS chat_prompt_log (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -245,6 +327,13 @@ def init() -> None:
             message_count INTEGER,
             bytes        INTEGER,
             requests     TEXT NOT NULL DEFAULT '[]',  -- 本回合实际发出的全部请求（URL + body）
+            turn_id       TEXT NOT NULL DEFAULT '',
+            finish_reason TEXT NOT NULL DEFAULT '',
+            sections_json TEXT NOT NULL DEFAULT '{}',  -- 按 section 的 token 统计
+            prompt_hash   TEXT NOT NULL DEFAULT '',    -- 固定前缀 hash（对照 prefix cache）
+            worldbook_json TEXT NOT NULL DEFAULT '[]', -- 本轮命中的世界书条目
+            memory_json   TEXT NOT NULL DEFAULT '[]',  -- 本轮注入的记忆槽位
+            diff_json     TEXT NOT NULL DEFAULT '[]',  -- 与上一轮相比的分段 diff
             created_at   TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_prompt_session ON chat_prompt_log(session_id, id);
@@ -499,6 +588,7 @@ def init() -> None:
             enabled       INTEGER NOT NULL DEFAULT 1,
             is_default    INTEGER NOT NULL DEFAULT 0,
             default_model TEXT DEFAULT '',
+            profile       TEXT NOT NULL DEFAULT '{}',
             created_at    TEXT NOT NULL,
             updated_at    TEXT NOT NULL
         );
@@ -602,6 +692,14 @@ def init() -> None:
             ON media_generations(created_at DESC);
         """
     )
+    # 中文全文索引：trigram 分词支持子串匹配；建不起来就落回纯 Python BM25
+    try:
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS chat_memory_fts USING fts5("
+            "memory_id UNINDEXED, content, subject, object,"
+            " tokenize='trigram')")
+    except sqlite3.OperationalError:
+        pass
     conn.execute(
         "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?)",
         (str(SCHEMA_VERSION),),
@@ -655,10 +753,59 @@ def init() -> None:
     if icols and "seed" not in icols:
         conn.execute("ALTER TABLE image_works ADD COLUMN seed INTEGER NOT NULL DEFAULT 0")
 
-    # Prompt 快照：旧表只有 messages → 补 requests 列（汇总本回合实际发出的全部请求）
+    # Prompt 快照：旧表只有 messages → 补列（请求汇总 / 回合标识 / 分段统计）
     pcols = {r["name"] for r in conn.execute("PRAGMA table_info(chat_prompt_log)").fetchall()}
-    if pcols and "requests" not in pcols:
-        conn.execute("ALTER TABLE chat_prompt_log ADD COLUMN requests TEXT NOT NULL DEFAULT '[]'")
+    for col, ddl in (
+        ("requests", "requests TEXT NOT NULL DEFAULT '[]'"),
+        ("turn_id", "turn_id TEXT NOT NULL DEFAULT ''"),
+        ("finish_reason", "finish_reason TEXT NOT NULL DEFAULT ''"),
+        ("sections_json", "sections_json TEXT NOT NULL DEFAULT '{}'"),
+        ("prompt_hash", "prompt_hash TEXT NOT NULL DEFAULT ''"),
+        ("worldbook_json", "worldbook_json TEXT NOT NULL DEFAULT '[]'"),
+        ("memory_json", "memory_json TEXT NOT NULL DEFAULT '[]'"),
+        ("diff_json", "diff_json TEXT NOT NULL DEFAULT '[]'"),
+    ):
+        if col not in pcols:
+            conn.execute(f"ALTER TABLE chat_prompt_log ADD COLUMN {ddl}")
+    scols = {r["name"] for r in conn.execute("PRAGMA table_info(chat_summary_state)").fetchall()}
+    for col, ddl in (
+        ("rolling_summary", "rolling_summary TEXT NOT NULL DEFAULT ''"),
+        ("turns_since_update", "turns_since_update INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if scols and col not in scols:
+            conn.execute(f"ALTER TABLE chat_summary_state ADD COLUMN {ddl}")
+    pcols = {r["name"] for r in conn.execute("PRAGMA table_info(llm_providers)").fetchall()}
+    if "profile" not in pcols:
+        conn.execute("ALTER TABLE llm_providers ADD COLUMN profile TEXT"
+                     " NOT NULL DEFAULT '{}'")
+
+    # 记忆向量：旧表是「一条记忆一个 JSON 向量」→ 重建为「记忆 × 模型」float32
+    vcols = {r["name"] for r in conn.execute(
+        "PRAGMA table_info(chat_memory_vectors)").fetchall()}
+    if vcols and "model" not in vcols:
+        conn.execute("ALTER TABLE chat_memory_vectors"
+                     " RENAME TO chat_memory_vectors_old")
+        conn.execute("CREATE TABLE chat_memory_vectors ("
+                     " memory_id INTEGER NOT NULL,"
+                     " model TEXT NOT NULL DEFAULT 'hash',"
+                     " dim INTEGER NOT NULL,"
+                     " vec BLOB NOT NULL,"
+                     " PRIMARY KEY(memory_id, model))")
+        for r in conn.execute("SELECT memory_id, vec FROM chat_memory_vectors_old"
+                              ).fetchall():
+            try:
+                vals = [float(x) for x in json.loads(r["vec"] or "[]")]
+            except (ValueError, TypeError):
+                vals = []
+            if not vals:
+                continue
+            norm = (sum(x * x for x in vals)) ** 0.5 or 1.0
+            conn.execute(
+                "INSERT OR REPLACE INTO chat_memory_vectors(memory_id, model, dim, vec)"
+                " VALUES(?, 'hash', ?, ?)",
+                (int(r["memory_id"]), len(vals),
+                 struct.pack(f"{len(vals)}f", *[x / norm for x in vals])))
+        conn.execute("DROP TABLE chat_memory_vectors_old")
 
     # 创作页配置种子：筛选项与模型列表（线上没登录时也够用）
     now = now_iso()
@@ -3855,6 +4002,36 @@ def active_llm_endpoint() -> tuple[str, str, str] | None:
     return None
 
 
+def llm_profile(rate_id=None) -> dict:
+    """接入的格式适配配置（provider profile JSON，空字典表示用默认协议）。
+
+    指定模型时按该接入；否则按默认接入。支持：
+      max_tokens_field  max_tokens / max_completion_tokens
+      stop              stop 序列（字符串或数组）
+      extra             需要原样并入 payload 的额外字段
+    """
+    pid = None
+    rid = str(rate_id or "").strip()
+    if rid not in ("", "None"):
+        picked = resolve_rate_id(rid)
+        if picked:
+            pid = picked[0]["id"]
+    if pid is None:
+        rows = query("SELECT id FROM llm_providers WHERE enabled=1"
+                     " ORDER BY is_default DESC, id ASC")
+        pid = rows[0]["id"] if rows else None
+    if not pid:
+        return {}
+    row = one("SELECT profile FROM llm_providers WHERE id=?", (int(pid),))
+    if not row or not row["profile"]:
+        return {}
+    try:
+        obj = json.loads(row["profile"])
+    except (ValueError, TypeError):
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
 def save_llm_provider(payload: dict) -> dict | None:
     """新建/更新一条接入。api_key 留空表示不改（控制台回显的是打码后的密钥）"""
     pid = payload.get("id")
@@ -4671,6 +4848,7 @@ _WB_POSITIONS = {
     "before_char": 0, "before": 0, "before_an": 0, "at_start": 0,
     "after_char": 1, "after": 1, "after_an": 1, "at_end": 1,
 }
+_WB_POS_AFTER_NAMES = ("after_char", "after", "after_an", "at_end", "1")
 
 
 def _wb_position(value) -> int:
@@ -4721,6 +4899,24 @@ def save_worldbook_entry(user_id: int, payload: dict, custom: bool = False,
     if cid:
         merged["characterID"] = cid
         merged["characterId"] = cid
+    # 世界书字段落地（旧 payload 没写 → 写回时补默认值，便于引擎直接读）
+    merged.setdefault("constant", False)
+    merged.setdefault("probability", 100)
+    try:
+        merged["order"] = int(merged.get("order") or 0)
+    except (TypeError, ValueError):
+        merged["order"] = 0
+    try:
+        merged["depth"] = int(merged.get("depth") or 0)
+    except (TypeError, ValueError):
+        merged["depth"] = 0
+    merged.setdefault("group", "")
+    merged.setdefault("recursive", False)
+    pos_raw = merged.get("position") or merged.get("pos") or "before_char"
+    merged["position"] = "at_depth" if str(pos_raw).strip().lower() in (
+        "at_depth", "depth", "2") else (
+        "after_char" if str(pos_raw).strip().lower() in _WB_POS_AFTER_NAMES
+        else "before_char")
     now = now_iso()
     raw_pos = payload.get("order")
     if raw_pos in (None, ""):
@@ -5636,30 +5832,149 @@ def _thread_view(row: dict) -> dict:
     }
 
 
-def chat_memories(user_id: int | None, character_id: str) -> list[dict]:
-    """记忆区列表（按角色，升序——旧摘要在前，注入时新的排后面）"""
-    rows = query(
-        "SELECT * FROM chat_memories WHERE user_id IS ? AND character_id=?"
-        " ORDER BY id ASC", (user_id, character_id or ""))
+def chat_memories(user_id: int | None, character_id: str,
+                  session_id: str | None = None) -> list[dict]:
+    """记忆区列表（升序——旧摘要在前，注入时新的排后面）。
+
+    传 session_id 时只读该会话的记忆；不传则按角色读（兼容控制台旧视图）。
+    """
+    if session_id is not None:
+        rows = query(
+            "SELECT * FROM chat_memories WHERE user_id IS ? AND character_id=?"
+            " AND session_id=? ORDER BY id ASC",
+            (user_id, character_id or "", str(session_id)))
+    else:
+        rows = query(
+            "SELECT * FROM chat_memories WHERE user_id IS ? AND character_id=?"
+            " ORDER BY id ASC", (user_id, character_id or ""))
     return [{"id": int(r["id"]), "content": str(r["content"] or ""),
              "round": int(r["round_no"] or 0),
              "createdAt": str(r["created_at"] or "")} for r in rows]
 
 
-def add_chat_memory(user_id: int | None, character_id: str, session_id: str,
-                    content: str, round_no: int = 0) -> int | None:
-    cur = get_conn().execute(
-        "INSERT INTO chat_memories(user_id, character_id, session_id, content,"
-        " round_no, created_at) VALUES(?,?,?,?,?,?)",
-        (user_id, character_id or None, session_id or None,
-         str(content or "").strip(), int(round_no or 0), now_iso()))
-    return int(cur.lastrowid or 0) or None
-
-
 def delete_chat_memory(user_id: int | None, memory_id: int) -> int:
-    cur = execute("DELETE FROM chat_memories WHERE user_id IS ? AND id=?",
-                  (user_id, int(memory_id or 0)))
-    return int(cur.rowcount or 0)
+    return int(execute("DELETE FROM chat_memories WHERE user_id IS ? AND id=?",
+                       (user_id, int(memory_id or 0))) or 0)
+
+
+def delete_chat_memory_state(user_id: int | None, *, session_id: str = "",
+                             character_id: str = "") -> int:
+    """删除会话/角色历史时同步清理记忆与游标，避免删了历史还能“记住”。"""
+    n = 0
+    if session_id:
+        n += int(execute(
+            "DELETE FROM chat_memories WHERE user_id IS ? AND session_id=?",
+            (user_id, str(session_id))) or 0)
+        execute("DELETE FROM chat_memory_slots WHERE user_id IS ? AND session_id=?",
+                (user_id, str(session_id)))
+        execute("DELETE FROM chat_summary_state WHERE session_id=? AND user_id IS ?",
+                (str(session_id), user_id))
+        _purge_memory_items("user_id IS ? AND session_id=?", (user_id, str(session_id)))
+    elif character_id:
+        n += int(execute(
+            "DELETE FROM chat_memories WHERE user_id IS ? AND character_id=?",
+            (user_id, character_id or "")) or 0)
+        execute("DELETE FROM chat_memory_slots WHERE user_id IS ? AND character_id=?",
+                (user_id, character_id or ""))
+        execute("DELETE FROM chat_summary_state WHERE user_id IS ? AND character_id=?",
+                (user_id, character_id or ""))
+        _purge_memory_items("user_id IS ? AND character_id=?",
+                            (user_id, character_id or ""))
+    return n
+
+
+# ------------------------------------------------- 记忆固定槽位
+MEMORY_SLOTS = ("short_term", "long_term", "user_info", "promise")
+
+
+def memory_slots(user_id: int | None, session_id: str) -> dict:
+    """读该会话的四类记忆槽位（未写入的槽返回空串）。"""
+    rows = query("SELECT slot, content, covered_until FROM chat_memory_slots"
+                 " WHERE user_id IS ? AND session_id=?", (user_id, str(session_id)))
+    out = {s: {"content": "", "covered_until": 0} for s in MEMORY_SLOTS}
+    for r in rows:
+        slot = str(r["slot"] or "")
+        if slot in out:
+            out[slot] = {"content": str(r["content"] or ""),
+                         "covered_until": int(r["covered_until"] or 0)}
+    return out
+
+
+def set_memory_slot(user_id: int | None, character_id: str, session_id: str,
+                    slot: str, content: str, covered_until: int = 0) -> None:
+    if slot not in MEMORY_SLOTS:
+        return
+    execute(
+        "INSERT INTO chat_memory_slots(user_id, character_id, session_id, slot,"
+        " content, covered_until, updated_at) VALUES(?,?,?,?,?,?,?)"
+        " ON CONFLICT(session_id, slot) DO UPDATE SET"
+        " user_id=excluded.user_id, character_id=excluded.character_id,"
+        " content=excluded.content, covered_until=excluded.covered_until,"
+        " updated_at=excluded.updated_at",
+        (user_id, character_id or None, str(session_id), slot,
+         str(content or "").strip(), int(covered_until or 0), now_iso()))
+
+
+def summary_state(user_id: int | None, session_id: str) -> dict:
+    row = one("SELECT * FROM chat_summary_state WHERE session_id=? AND user_id IS ?",
+              (str(session_id or ""), user_id))
+    if row is None:
+        return {"covered_until": 0, "covered_count": 0,
+                "rolling_summary": "", "turns_since_update": 0}
+    return {"covered_until": int(row["covered_until"] or 0),
+            "covered_count": int(row["covered_count"] or 0),
+            "rolling_summary": str(row["rolling_summary"] or ""),
+            "turns_since_update": int(row["turns_since_update"] or 0)}
+
+
+def update_summary_state(user_id: int | None, character_id: str, session_id: str,
+                         *, rolling_summary: str | None = None,
+                         turns_since_update: int | None = None,
+                         covered_until: int | None = None,
+                         covered_count: int | None = None) -> None:
+    cur = summary_state(user_id, session_id)
+    execute(
+        "INSERT INTO chat_summary_state(session_id, user_id, character_id,"
+        " covered_until, covered_count, rolling_summary, turns_since_update,"
+        " updated_at) VALUES(?,?,?,?,?,?,?,?)"
+        " ON CONFLICT(session_id) DO UPDATE SET"
+        " user_id=excluded.user_id, character_id=excluded.character_id,"
+        " covered_until=excluded.covered_until, covered_count=excluded.covered_count,"
+        " rolling_summary=excluded.rolling_summary,"
+        " turns_since_update=excluded.turns_since_update,"
+        " updated_at=excluded.updated_at",
+        (str(session_id), user_id, character_id or None,
+         int(cur["covered_until"] if covered_until is None else covered_until),
+         int(cur["covered_count"] if covered_count is None else covered_count),
+         str(cur["rolling_summary"] if rolling_summary is None else rolling_summary),
+         int(cur["turns_since_update"] if turns_since_update is None
+             else turns_since_update), now_iso()))
+
+
+def record_first_message_once(user_id: int | None, session_id: str,
+                              content: str) -> int:
+    """会话还没有任何消息时写入 firstMes（D3：后端只写一次）。"""
+    text = str(content or "").strip()
+    if not text or not session_id:
+        return 0
+    row = one("SELECT t.id FROM chat_threads t WHERE t.user_id IS ? AND t.session_id=?",
+              (user_id, str(session_id)))
+    if row is None:
+        return 0
+    tid = row["id"]
+    cur = get_conn().execute(
+        "INSERT INTO chat_messages(thread_id, role, content, content_llm, created_at)"
+        " SELECT ?, 'assistant', ?, ?, ? WHERE NOT EXISTS"
+        " (SELECT 1 FROM chat_messages WHERE thread_id=?)",
+        (tid, text, "", now_iso(), tid))
+    if int(cur.rowcount or 0) <= 0:      # 已有消息 → 不重复写开场白
+        return 0
+    mid = int(cur.lastrowid or 0)
+    if mid:
+        execute("UPDATE chat_threads SET message_count=(SELECT COUNT(*) FROM chat_messages"
+                " WHERE thread_id=?), preview=?, updated_at=? WHERE id=?",
+                (tid, text[:200], now_iso(), tid))
+    return mid
 
 
 def ensure_chat_session(user_id: int | None, character_id: str, session_id: str = "",
@@ -5734,6 +6049,61 @@ def thread_stats(user_id: int | None, session_id: str) -> dict:
     return out
 
 
+def update_thread_stats(user_id: int | None, session_id: str, values: dict) -> dict:
+    """把本轮状态合并回会话（stats_json 作为跨轮真相源）。
+
+    只覆盖传进来的属性；缺字段保留上一轮的值，而不是回落到初始值。
+    """
+    if not session_id or not isinstance(values, dict) or not values:
+        return thread_stats(user_id, session_id)
+    row = one("SELECT id, stats_json FROM chat_threads WHERE user_id IS ? AND session_id=?",
+              (user_id, str(session_id)))
+    if row is None:
+        return {}
+    try:
+        old = json.loads(str(row["stats_json"] or "{}"))
+    except ValueError:
+        old = {}
+    if not isinstance(old, dict):
+        old = {}
+    merged = dict(old)
+    for k, v in values.items():
+        if v is None:
+            continue
+        try:
+            merged[str(k)] = int(float(v))
+        except (TypeError, ValueError):
+            continue
+    execute("UPDATE chat_threads SET stats_json=? WHERE id=?",
+            (json.dumps(merged, ensure_ascii=False), row["id"]))
+    return {str(k): int(v) for k, v in merged.items()}
+
+
+def delete_chat_message(user_id: int | None, message_id: int) -> bool:
+    """删一条消息并回填 message_count / preview（失败路径清理孤立 user 消息）。"""
+    try:
+        mid = int(message_id or 0)
+    except (TypeError, ValueError):
+        return False
+    if mid <= 0:
+        return False
+    row = one("SELECT m.thread_id FROM chat_messages m"
+              " JOIN chat_threads t ON t.id=m.thread_id"
+              " WHERE m.id=? AND t.user_id IS ?", (mid, user_id))
+    if row is None:
+        return False
+    tid = row["thread_id"]
+    n = execute("DELETE FROM chat_messages WHERE id=? AND thread_id=?", (mid, tid))
+    if not n:
+        return False
+    last = one("SELECT content FROM chat_messages WHERE thread_id=?"
+               " ORDER BY id DESC LIMIT 1", (tid,))
+    execute("UPDATE chat_threads SET message_count=(SELECT COUNT(*) FROM chat_messages"
+            " WHERE thread_id=?), preview=?, updated_at=? WHERE id=?",
+            (tid, str((last or {}).get("content") or "")[:200], now_iso(), tid))
+    return True
+
+
 def record_chat_message(user_id: int, session_id: str, role: str, content: str,
                         content_llm: str | None = None) -> int | None:
     """写一条消息并刷新会话的 messageCount / 最后一条预览。
@@ -5767,12 +6137,17 @@ def record_chat_message(user_id: int, session_id: str, role: str, content: str,
 
 
 def record_chat_prompt(user_id: int | None, session_id: str, character_id: str,
-                       model: str, requests: list) -> int | None:
+                       model: str, requests: list, *, turn_id: str = "",
+                       finish_reason: str = "", sections: list | None = None,
+                       prompt_hash: str = "", worldbook: list | None = None,
+                       memory: list | None = None,
+                       diff: list | None = None) -> int | None:
     """把一次对话里**实际发出的全部请求**汇总成一条快照。
 
     requests 由发送钩子逐条收集，形如
     [{"url": "...", "stream": true, "payload": {"model": "...", "messages": [...]}}, ...]
     汇总口径：一次对话 = 一条记录；主请求的 messages 单独拆出来方便检索，完整数据在 requests。
+    turn_id / finish_reason / sections / prompt_hash 是阶段 0 的回归对照字段。
     """
     if not requests:
         return None
@@ -5793,13 +6168,53 @@ def record_chat_prompt(user_id: int | None, session_id: str, character_id: str,
         msgs_json = json.dumps(msgs, ensure_ascii=False)
     except Exception:
         msgs_json = "[]"
+    try:
+        sections_json = json.dumps(sections or [], ensure_ascii=False)
+    except Exception:
+        sections_json = "[]"
+    def _dump(v):
+        try:
+            return json.dumps(v or [], ensure_ascii=False)
+        except Exception:
+            return "[]"
     cur = get_conn().execute(
         "INSERT INTO chat_prompt_log(user_id, session_id, character_id, model,"
-        " messages, message_count, bytes, requests, created_at)"
-        " VALUES(?,?,?,?,?,?,?,?,?)",
+        " messages, message_count, bytes, requests, turn_id, finish_reason,"
+        " sections_json, prompt_hash, worldbook_json, memory_json, diff_json,"
+        " created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (user_id, session_id, character_id, model, msgs_json, len(msgs),
-         len(payload.encode("utf-8")), payload, now_iso()))
+         len(payload.encode("utf-8")), payload, str(turn_id or ""),
+         str(finish_reason or ""), sections_json, str(prompt_hash or ""),
+         _dump(worldbook), _dump(memory), _dump(diff), now_iso()))
     return int(cur.lastrowid or 0)
+
+
+def recent_chat_prompts(user_id: int | None = None, session_id: str = "",
+                       limit: int = 10) -> list[dict]:
+    """控制台只读：最近几轮 prompt 快照（含分段统计与本轮 diff）。"""
+    where, args = [], []
+    if user_id is not None:
+        where.append("user_id IS ?")
+        args.append(user_id)
+    if session_id:
+        where.append("session_id=?")
+        args.append(str(session_id))
+    sql = "SELECT * FROM chat_prompt_log"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    rows = query(sql + " ORDER BY id DESC LIMIT ?",
+                 tuple(args) + (max(1, min(int(limit or 10), 100)),))
+    out = []
+    for r in rows:
+        item = dict(r)
+        for k in ("messages", "requests", "sections_json", "worldbook_json",
+                  "memory_json", "diff_json"):
+            try:
+                item[k] = json.loads(item.get(k) or "[]")
+            except (ValueError, TypeError):
+                pass
+        out.append(item)
+    return out
 
 
 def chat_sessions(user_id: int | None, character_id: str = "", page: int = 1,
@@ -5888,15 +6303,9 @@ def chat_messages(user_id: int | None, session_id: str, page_size: int = 20,
 def delete_chat_history(user_id: int | None, character_id: str) -> int:
     n = one("SELECT COUNT(*) AS c FROM chat_threads WHERE user_id IS ? AND character_id=?",
             (user_id, character_id))["c"]
+    delete_chat_memory_state(user_id, character_id=character_id)
     execute("DELETE FROM chat_threads WHERE user_id IS ? AND character_id=?",
             (user_id, character_id))
-    return int(n)
-
-
-def clear_chat_history(user_id: int | None) -> int:
-    n = one("SELECT COUNT(*) AS c FROM chat_threads WHERE user_id IS ?",
-            (user_id,))["c"]
-    execute("DELETE FROM chat_threads WHERE user_id IS ?", (user_id,))
     return int(n)
 
 
@@ -6557,3 +6966,369 @@ def _load_current_db() -> None:
 _load_current_db()
 init()
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ------------------------------------------------- 算法记忆
+_HAS_FTS = None
+
+
+def has_fts5() -> bool:
+    """FTS5 虚拟表是否可用；不可用则检索层自动落回纯 Python BM25。"""
+    global _HAS_FTS
+    if _HAS_FTS is None:
+        try:
+            get_conn().execute("SELECT 1 FROM chat_memory_fts LIMIT 1")
+            _HAS_FTS = True
+        except sqlite3.OperationalError:
+            _HAS_FTS = False
+    return bool(_HAS_FTS)
+
+
+def _fts_insert(memory_id: int, content: str, subject: str = "",
+                object_: str = "") -> None:
+    if not has_fts5():
+        return
+    try:
+        get_conn().execute(
+            "INSERT INTO chat_memory_fts(memory_id, content, subject, object)"
+            " VALUES(?,?,?,?)",
+            (int(memory_id), str(content or ""), str(subject or ""),
+             str(object_ or "")))
+    except sqlite3.OperationalError:
+        pass
+
+
+def _fts_delete(memory_id: int) -> None:
+    if not has_fts5():
+        return
+    try:
+        execute("DELETE FROM chat_memory_fts WHERE memory_id=?", (int(memory_id),))
+    except sqlite3.OperationalError:
+        pass
+
+
+def _decode_vec(raw) -> list:
+    if raw is None:
+        return []
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            n = len(raw) // 4
+            return list(struct.unpack(f"{n}f", raw[:n * 4]))
+        except struct.error:
+            return []
+    try:
+        obj = json.loads(raw or "[]")
+    except (ValueError, TypeError):
+        return []
+    return [float(x) for x in obj] if isinstance(obj, list) else []
+
+
+def _encode_vec(embedding) -> bytes:
+    """L2 归一化后打包成 float32 二进制（体积减半且不丢精度）。"""
+    vals = [float(x) for x in (embedding or [])]
+    if not vals:
+        return b""
+    norm = (sum(x * x for x in vals)) ** 0.5 or 1.0
+    return struct.pack(f"{len(vals)}f", *[x / norm for x in vals])
+
+
+def set_memory_vector(memory_id: int, embedding, model: str = "hash") -> None:
+    """写一条「记忆 × 模型」向量；同模型覆盖，换模型并存。"""
+    blob = _encode_vec(embedding)
+    if not memory_id or not blob:
+        return
+    execute(
+        "INSERT INTO chat_memory_vectors(memory_id, model, dim, vec)"
+        " VALUES(?,?,?,?) ON CONFLICT(memory_id, model)"
+        " DO UPDATE SET dim=excluded.dim, vec=excluded.vec",
+        (int(memory_id), str(model or "hash"), len(blob) // 4, blob))
+
+
+def add_memory_item(user_id: int | None, character_id: str, session_id: str,
+                    kind: str, content: str, *, importance: float = 0.5,
+                    confidence: float = 0.7, subject: str = "",
+                    object_: str = "", event_time: str = "",
+                    source_turn: str = "", source_msg_ids=None,
+                    embedding=None, embedding_model: str = "hash",
+                    cluster_id=None) -> int:
+    """新增一条结构化记忆，并同步向量表与 FTS5 索引。"""
+    text = str(content or "").strip()
+    if not text:
+        return 0
+    h = hashlib.sha1(re.sub(r"\s+", " ", text.lower()).encode("utf-8")).hexdigest()
+    ts = now_iso()
+    cur = get_conn().execute(
+        "INSERT INTO chat_memory_items(user_id, character_id, session_id, kind,"
+        " content, subject, object, importance, confidence, event_time,"
+        " source_turn, source_msg_ids, status, hash, cluster_id, created_at,"
+        " updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'active', ?,?,?,?)",
+        (user_id, character_id or "", str(session_id), str(kind or "fact"),
+         text, str(subject or ""), str(object_ or ""),
+         float(importance or 0.5), float(confidence or 0.7),
+         str(event_time or ""), str(source_turn or ""),
+         json.dumps(list(source_msg_ids or []), ensure_ascii=False),
+         h, cluster_id, ts, ts))
+    mid = int(cur.lastrowid or 0)
+    if mid and embedding:
+        set_memory_vector(mid, embedding, embedding_model)
+    _fts_insert(mid, text, subject, object_)
+    return mid
+
+
+def update_memory_item(memory_id: int, *, content: str | None = None,
+                       importance: float | None = None,
+                       confidence: float | None = None,
+                       status: str | None = None,
+                       source_turn: str | None = None,
+                       event_time: str | None = None,
+                       cluster_id: int | None = None,
+                       merged_into: int | None = None,
+                       last_recalled_at: str | None = None,
+                       recall_count: int | None = None) -> None:
+    fields, args = [], []
+    for col, val in (("content", content), ("importance", importance),
+                     ("confidence", confidence), ("status", status),
+                     ("source_turn", source_turn), ("event_time", event_time),
+                     ("cluster_id", cluster_id), ("merged_into", merged_into),
+                     ("last_recalled_at", last_recalled_at),
+                     ("recall_count", recall_count)):
+        if val is not None:
+            fields.append(f"{col}=?")
+            args.append(val)
+    if not fields:
+        return
+    fields.append("updated_at=?")
+    args.append(now_iso())
+    execute(f"UPDATE chat_memory_items SET {', '.join(fields)} WHERE id=?",
+            tuple(args) + (int(memory_id),))
+    if content is not None:
+        row = one("SELECT id, content, subject, object FROM chat_memory_items"
+                  " WHERE id=?", (int(memory_id),))
+        if row:
+            _fts_delete(memory_id)
+            _fts_insert(memory_id, row["content"], row["subject"], row["object"])
+
+
+def memory_items(user_id: int | None, character_id: str, session_id: str = "",
+                 status: str = "active", limit: int = 300) -> list[dict]:
+    """按会话/角色取结构化记忆（带向量）；status='' 表示全部状态。"""
+    where = ["i.user_id IS ?"]
+    args = [user_id]
+    if character_id:
+        where.append("i.character_id=?")
+        args.append(str(character_id))
+    if session_id:
+        where.append("i.session_id=?")
+        args.append(str(session_id))
+    if status:
+        where.append("i.status=?")
+        args.append(str(status))
+    sql = ("SELECT i.* FROM chat_memory_items i"
+           " WHERE " + " AND ".join(where) + " ORDER BY i.id DESC")
+    if limit and int(limit) > 0:
+        sql += " LIMIT ?"
+        args.append(int(limit))
+    rows = query(sql, tuple(args))
+    vecs: dict[int, dict] = {}
+    ids = [int(r["id"]) for r in rows]
+    if ids:
+        marks = ",".join("?" * len(ids))
+        for v in query("SELECT memory_id, model, vec FROM chat_memory_vectors"
+                       f" WHERE memory_id IN ({marks})", tuple(ids)):
+            vecs.setdefault(int(v["memory_id"]), {})[str(v["model"])] = \
+                _decode_vec(v["vec"])
+    out = []
+    for r in rows:
+        item = dict(r)
+        item["vecs"] = vecs.get(int(item["id"]), {})
+        # 兼容旧读取：vec 默认给 hash 基线向量
+        item["vec"] = (item["vecs"].get("hash")
+                       or next(iter(item["vecs"].values()), []))
+        try:
+            item["source_msg_ids"] = json.loads(item.get("source_msg_ids") or "[]")
+        except (ValueError, TypeError):
+            item["source_msg_ids"] = []
+        out.append(item)
+    return out
+
+
+def memory_count(user_id: int | None, character_id: str, session_id: str = "",
+                 status: str = "active") -> int:
+    where = ["user_id IS ?"]
+    args = [user_id]
+    if character_id:
+        where.append("character_id=?")
+        args.append(str(character_id))
+    if session_id:
+        where.append("session_id=?")
+        args.append(str(session_id))
+    if status:
+        where.append("status=?")
+        args.append(str(status))
+    row = one("SELECT COUNT(*) AS n FROM chat_memory_items WHERE "
+              + " AND ".join(where), tuple(args))
+    return int((row or {}).get("n") or 0) if row else 0
+
+
+def memory_vector_by_hash(content_hash_value: str, model: str) -> list:
+    """成本控制：同内容 hash + 同模型的向量直接复用，不重复请求。"""
+    if not content_hash_value:
+        return []
+    row = one(
+        "SELECT v.vec FROM chat_memory_vectors v"
+        " JOIN chat_memory_items i ON i.id=v.memory_id"
+        " WHERE i.hash=? AND v.model=? LIMIT 1",
+        (str(content_hash_value), str(model or "hash")))
+    return _decode_vec(row["vec"]) if row else []
+
+
+def items_missing_vector(user_id: int | None, character_id: str, session_id: str,
+                         model: str, limit: int = 64) -> list[dict]:
+    """补算入口用：还没在当前模型空间建向量的活跃记忆。"""
+    where = ["i.user_id IS ?", "i.status='active'"]
+    args = [user_id]
+    if character_id:
+        where.append("i.character_id=?")
+        args.append(str(character_id))
+    if session_id:
+        where.append("i.session_id=?")
+        args.append(str(session_id))
+    rows = query(
+        "SELECT i.id, i.content, i.hash FROM chat_memory_items i"
+        " LEFT JOIN chat_memory_vectors v ON v.memory_id=i.id AND v.model=?"
+        " WHERE v.memory_id IS NULL AND " + " AND ".join(where) +
+        " ORDER BY i.id DESC LIMIT ?",
+        (str(model or "hash"),) + tuple(args) + (max(1, int(limit or 64)),))
+    return [dict(r) for r in rows]
+
+
+def search_memory_fts(user_id: int | None, character_id: str, session_id: str,
+                      query_text: str, limit: int = 50) -> dict[int, float]:
+    """FTS5 检索；返回 {memory_id: 相关度}。不可用/无命中返回空 → 调用方用 BM25。
+
+    FTS5 的 bm25() 越小越相关（通常为负），这里取反成“越大越相关”。
+    """
+    if not has_fts5():
+        return {}
+    # trigram 分词器要求查询词 ≥3 字；中文按 3 字滑窗切成候选词，
+    # 英文按空白切分（短词交给纯 Python BM25 兜底）。
+    terms: list[str] = []
+    for word in re.findall(r"[A-Za-z0-9_]{3,}", str(query_text or "")):
+        terms.append(word.lower())
+    for run in re.findall(r"[\u4e00-\u9fff]{3,}", str(query_text or "")):
+        terms.extend(run[i:i + 3] for i in range(len(run) - 2))
+    seen, uniq = set(), []
+    for t in terms:
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+    terms = uniq[:16]
+    if not terms:
+        return {}
+    match = " OR ".join('"' + t.replace('"', "") + '"' for t in terms)
+    where = ["i.user_id IS ?", "i.status='active'"]
+    args = [user_id]
+    if character_id:
+        where.append("i.character_id=?")
+        args.append(str(character_id))
+    if session_id:
+        where.append("i.session_id=?")
+        args.append(str(session_id))
+    try:
+        rows = query(
+            "SELECT f.memory_id AS memory_id, bm25(chat_memory_fts) AS score"
+            " FROM chat_memory_fts f JOIN chat_memory_items i ON i.id=f.memory_id"
+            " WHERE chat_memory_fts MATCH ? AND " + " AND ".join(where) +
+            " ORDER BY score LIMIT ?", (match,) + tuple(args) + (int(limit),))
+    except sqlite3.OperationalError:
+        return {}
+    return {int(r["memory_id"]): -float(r["score"] or 0.0) for r in rows}
+
+
+def merge_memory_items(old_ids, new_id: int) -> None:
+    """整合：旧条目归档并指向新条目（不物理删除）。"""
+    for mid in old_ids or []:
+        update_memory_item(int(mid), status="archived", merged_into=int(new_id))
+
+
+def archive_memory_items(ids) -> None:
+    ts = now_iso()
+    for mid in ids or []:
+        execute("UPDATE chat_memory_items SET status='archived', updated_at=?"
+                " WHERE id=? AND status='active'", (ts, int(mid)))
+
+
+def archive_stale_memories(user_id: int | None, character_id: str,
+                           session_id: str, days: float = 60.0,
+                           max_importance: float = 0.35) -> int:
+    """遗忘层：长期未召回且低重要度 → 归档（保留行，召回时默认不参与）。"""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, float(days)))
+              ).astimezone().isoformat(timespec="seconds")
+    where = ["user_id IS ?", "status='active'", "importance < ?",
+             "COALESCE(last_recalled_at, created_at) < ?"]
+    args = [user_id, float(max_importance), cutoff]
+    if character_id:
+        where.append("character_id=?")
+        args.append(str(character_id))
+    if session_id:
+        where.append("session_id=?")
+        args.append(str(session_id))
+    return int(execute(
+        "UPDATE chat_memory_items SET status='archived', updated_at=?"
+        " WHERE " + " AND ".join(where), (now_iso(),) + tuple(args)) or 0)
+
+
+def bump_memory_recall(ids) -> None:
+    ts = now_iso()
+    for mid in ids or []:
+        execute("UPDATE chat_memory_items SET recall_count=recall_count+1,"
+                " last_recalled_at=?, updated_at=? WHERE id=?",
+                (ts, ts, int(mid)))
+
+
+def log_memory_recalls(user_id: int | None, session_id: str, turn_id: str,
+                       retrieved: list[dict]) -> None:
+    """可观测层：每轮记录召回了哪些条目、各分项得分、注入位置。"""
+    if not retrieved:
+        return
+    ts = now_iso()
+    for rank, item in enumerate(retrieved, 1):
+        execute(
+            "INSERT INTO chat_memory_recall_log(user_id, session_id, turn_id,"
+            " memory_id, rank, injected_at, score_json, created_at)"
+            " VALUES(?,?,?,?,?,?,?,?)",
+            (user_id, str(session_id or ""), str(turn_id or ""),
+             int(item.get("id") or 0), rank,
+             int(item.get("injected_at") or 0),
+             json.dumps(item.get("scores") or {}, ensure_ascii=False), ts))
+
+
+def memory_recalls(user_id: int | None, session_id: str = "",
+                   limit: int = 20) -> list[dict]:
+    """只读：最近几轮的记忆召回明细。"""
+    where, args = ["user_id IS ?"], [user_id]
+    if session_id:
+        where.append("session_id=?")
+        args.append(str(session_id))
+    rows = query("SELECT * FROM chat_memory_recall_log WHERE "
+                 + " AND ".join(where) + " ORDER BY id DESC LIMIT ?",
+                 tuple(args) + (max(1, int(limit or 20)),))
+    out = []
+    for r in rows:
+        item = dict(r)
+        try:
+            item["scores"] = json.loads(item.pop("score_json") or "{}")
+        except (ValueError, TypeError):
+            item["scores"] = {}
+        out.append(item)
+    return out
+
+
+def _purge_memory_items(where: str, args) -> None:
+    ids = [int(r["id"]) for r in
+           query("SELECT id FROM chat_memory_items WHERE " + where, args)]
+    for mid in ids:
+        execute("DELETE FROM chat_memory_vectors WHERE memory_id=?", (mid,))
+        _fts_delete(mid)
+    execute("DELETE FROM chat_memory_items WHERE " + where, args)
+
