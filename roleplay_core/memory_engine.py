@@ -90,8 +90,26 @@ def _emb_provider(cfg: dict) -> dict:
     return eb
 
 
+def _local_provider(cfg: dict) -> dict:
+    """本地 LSA 是否被选为默认向量空间（provider=local 且未显式关闭）。"""
+    eb = cfg.get("embedding") or {}
+    if not isinstance(eb, dict):
+        return {}
+    if str(eb.get("provider") or "").strip().lower() != "local":
+        return {}
+    if eb.get("local_enabled") is False:
+        return {}
+    return eb
+
+
 def embedding_model_id(cfg: dict) -> str:
     """当前检索空间的模型标识；没有可用 provider 时就是 hash 基线。"""
+    eb = _local_provider(cfg)
+    if eb:
+        from roleplay_core import local_embedder
+        meta = local_embedder.active_model(
+            str(eb.get("local_model") or local_embedder.DEFAULT_MODEL_NAME))
+        return local_embedder.model_id(meta) if meta else "hash"
     eb = _emb_provider(cfg)
     if not eb:
         return "hash"
@@ -101,11 +119,23 @@ def embedding_model_id(cfg: dict) -> str:
 
 
 def provider_embeddings(texts, cfg: dict) -> Tuple[str, List[List[float]], bool]:
-    """批量走 OpenAI 兼容 /v1/embeddings；失败回落哈希。
+    """批量取向量：本地 LSA 可直接算；OpenAI 兼容失败时回落哈希。
 
     返回 (模型标识, 向量列表, 是否降级)。调用方负责落库。
     """
     texts = [str(t or "") for t in (texts or [])]
+    local = _local_provider(cfg)
+    if local:
+        try:
+            from roleplay_core import local_embedder
+            meta = local_embedder.active_model(
+                str(local.get("local_model") or local_embedder.DEFAULT_MODEL_NAME))
+            if meta:
+                vecs = [local_embedder.project(t, meta) for t in texts]
+                if len(vecs) == len(texts) and all(vecs):
+                    return local_embedder.model_id(meta), [_unit(v) for v in vecs], False
+        except Exception as exc:                     # noqa: BLE001
+            print(f"[memory] 本地投影失败，回落哈希：{exc}", file=sys.stderr)
     eb = _emb_provider(cfg)
     if eb:
         try:
@@ -126,8 +156,23 @@ def provider_embeddings(texts, cfg: dict) -> Tuple[str, List[List[float]], bool]
 
 
 def query_vector(query: str, cfg: dict) -> Tuple[str, List[float], bool]:
-    """检索查询向量：短超时；超时/报错立刻回落哈希，不卡主流程。"""
+    """检索查询向量：本地 LSA 直接投影；OpenAI 短超时后回落哈希。"""
     text = str(query or "")
+    local = _local_provider(cfg)
+    if local:
+        try:
+            from roleplay_core import local_embedder
+            vec, mid, degraded = local_embedder.project_query(
+                text, str(local.get("local_model") or local_embedder.DEFAULT_MODEL_NAME))
+            if vec and not degraded:
+                if len(_Q_CACHE) >= _Q_CACHE_MAX:
+                    _Q_CACHE.clear()
+                _Q_CACHE[(mid, content_hash(text))] = vec
+                return mid, vec, False
+        except Exception as exc:                     # noqa: BLE001
+            print(f"[memory] 本地查询向量不可用，回落哈希：{exc}", file=sys.stderr)
+        dim = int(cfg.get("embedDim", DEFAULT_DIM) or DEFAULT_DIM)
+        return "hash", embed(text, dim), True
     limit = min(float(_emb_provider(cfg).get("timeout") or 30.0),
                 float(cfg.get("queryTimeout", 3.0) or 3.0))
     model = embedding_model_id(cfg)

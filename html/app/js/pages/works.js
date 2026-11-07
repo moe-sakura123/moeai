@@ -18,7 +18,7 @@
   };
 
   function cidOf(w) {
-    return T.str(T.pick(w, ['characterID', 'characterId', 'ID', 'id', 'workID']));
+    return T.str(T.pick(w, ['characterId', 'ID', 'id', 'workID']));
   }
 
   function statusOf(w) {
@@ -162,7 +162,7 @@
   /* ---------------------------------------------------------- 状态操作 */
   function setStatus(cid, kind, okMsg) {
     const url = { unpublish: '/api/gva/work/unpublish', cancel: '/api/gva/work/schedule/cancel' }[kind];
-    A.post(url, { characterID: cid })
+    A.post(url, { characterId: cid })
       .then(() => { U.toast(okMsg); load(); })
       .catch((err) => U.toast('操作失败：' + err.message, false));
   }
@@ -171,18 +171,18 @@
     const w = findWork(cid);
     const name = T.str(T.pick(w, ['name', 'title']), '该作品');
     U.confirmDialog('删除作品', '确定删除「' + name + '」吗？删除后不可恢复。', () => {
-      A.del('/api/gva/work', { characterID: cid })
+      A.del('/api/gva/work', { characterId: cid })
         .then(() => { U.toast('已删除「' + name + '」'); load(); })
         .catch((err) => U.toast('删除失败：' + err.message, false));
     });
   }
 
   function copyWork(cid) {
-    A.get('/api/gva/work/my', { characterID: cid })
+    A.get('/api/gva/work/my', { characterId: cid })
       .then((data) => {
         const w = (data && typeof data === 'object') ? Object.assign({}, data) : {};
-        // 去掉身份字段，让服务端生成新的 characterID
-        ['characterID', 'characterId', 'ID', 'id', 'workID', 'publishStatus',
+        // 去掉身份字段，让服务端生成新的 characterId
+        ['characterId', 'ID', 'id', 'workID', 'publishStatus',
           'status', 'scheduledPublishAt', 'updatedAt', 'createdAt'].forEach((k) => delete w[k]);
         w.name = T.str(T.pick(data, ['name', 'title']), '未命名') + ' 副本';
         return A.post('/api/gva/work', w);
@@ -224,13 +224,13 @@
             if (!val) { U.toast('请选择定时发布时间', false); return; }
             U.closeModal();
             A.post('/api/gva/work/schedule',
-              { characterID: cid, scheduledTime: new Date(val).toISOString() })
+              { characterId: cid, scheduledTime: new Date(val).toISOString() })
               .then(() => { U.toast('已设置定时发布'); load(); })
               .catch((err) => U.toast('定时发布失败：' + err.message, false));
             return;
           }
           U.closeModal();
-          A.post('/api/gva/work/publish', { characterID: cid })
+          A.post('/api/gva/work/publish', { characterId: cid })
             .then((data) => {
               const gain = data && data.experienceGained;
               U.toast(gain ? '已发布，+' + gain + ' 经验' : '已发布');

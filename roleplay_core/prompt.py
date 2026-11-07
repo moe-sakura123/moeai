@@ -317,7 +317,8 @@ def shrink_for_overflow(messages: List[Dict], level: int,
         out = _drop_blocks(out, ("### 世界书（前置）", "### 世界书（后置）",
                                  "### 世界书（深度注入）"))
     if lv >= 2:
-        out = _drop_blocks(out, ("### 记忆 · ", "### 相关记忆", "### 作者注"))
+        out = _drop_blocks(out, ("### 记忆 · ", "### 相关记忆", "### 记忆召回",
+                                 "### 作者注"))
     if lv >= 3:
         out = _drop_old_history(out, keep_recent)
     return out
@@ -446,6 +447,15 @@ def _retrieved_block(retrieved: List[Dict] | None, max_tokens: int = 600) -> str
                        max(60, int(max_tokens or 600)))
 
 
+def _injected_memory_block(cfg: Dict, retrieved: List[Dict] | None) -> str:
+    """记忆注入块：优先用新模块产出的文本，旧路径仅作为兼容后备。"""
+    mem = cfg.get("memory") if isinstance(cfg.get("memory"), dict) else {}
+    block = str(mem.get("injectedBlock") or "").strip()
+    if block:
+        return block
+    return _retrieved_block(retrieved, int(mem.get("maxTokens") or 600))
+
+
 def build_prompt(ctx, *, worldbook_entries: Iterable[Dict] | None = None,
                  memories: List[Dict] | None = None,
                  slots: Dict[str, str] | None = None,
@@ -480,10 +490,7 @@ def build_prompt(ctx, *, worldbook_entries: Iterable[Dict] | None = None,
     examples = trim_tokens("### 对话示例\n" + extra["mes_example"],
                            int(window * 0.10)) if extra["mes_example"] else ""
     depth_map = _merged_depth(wb["depth"], slot_text, _anchor_block(cfg, ctx),
-                              _retrieved_block(
-                                  retrieved,
-                                  int((cfg.get("memory") or {}).get("maxTokens")
-                                      or 600)),
+                              _injected_memory_block(cfg, retrieved),
                               int((cfg.get("memory") or {}).get("injectDepth")
                                   or 4))
     slot_tokens = sum(_tok(t) for texts in depth_map.values() for t in texts)

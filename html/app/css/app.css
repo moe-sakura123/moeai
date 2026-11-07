@@ -421,6 +421,19 @@ body.page-creation #tab-hint { display: none; }
 }
 .cs-switch-row { justify-content: space-between; }
 .cs-note { margin: 4px 0 0; }
+.cs-adv {
+  margin-top: 8px; padding-top: 6px;
+  border-top: 1px dashed rgba(255, 255, 255, .08);
+}
+.cs-adv > summary {
+  cursor: pointer; font-size: 12px; font-weight: 600; color: var(--muted);
+  list-style: none; padding: 4px 0;
+}
+.cs-adv > summary::-webkit-details-marker { display: none; }
+.cs-adv > summary::before { content: '▸ '; }
+.cs-adv[open] > summary::before { content: '▾ '; }
+.cs-adv .cs-row:first-of-type { border-top: 0; }
+.cs-mem-status { margin-top: 8px; }
 .no-author-style .msg .bubble { font-family: inherit; }
 
 /* 新建对话后自动加载的角色详细介绍网页：默认占满整个聊天区（像源站） */

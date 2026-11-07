@@ -2250,9 +2250,9 @@
         ${(preview.warnings || []).length ? `<div class="alert err">
           ${preview.warnings.map((w) => esc(w)).join('<br>')}</div>` : ''}
         ${(preview.items || []).length ? `<table class="cd-wb"><thead><tr>
-          <th>characterID</th><th>标题</th><th>内容</th><th>状态</th><th>世界书</th>
+          <th>characterId</th><th>标题</th><th>内容</th><th>状态</th><th>世界书</th>
           </tr></thead><tbody>${preview.items.map((it) => `<tr>
-            <td class="mono">${esc(it.characterID)}</td><td>${esc(it.title)}</td>
+            <td class="mono">${esc(it.characterId)}</td><td>${esc(it.title)}</td>
             <td>${it.body ? '作品整包' : '仅世界书'}</td><td class="muted">${esc(it.status)}</td>
             <td>${it.worldbook}</td></tr>`).join('')}</tbody></table>` : ''}` : '';
 
@@ -2272,7 +2272,7 @@
           <p class="muted small">创作页保存的整包就在这两张表里：列表看作品，点「查看」开整包
             （提示词 / 开场白 / 自定义世界书），右侧按钮直接导出成可再导入的 JSON。</p>
           <div class="toolbar">
-            <input id="cd-q" placeholder="搜索标题 / characterID / 简介" value="${esc(cdQ)}">
+            <input id="cd-q" placeholder="搜索标题 / characterId / 简介" value="${esc(cdQ)}">
             <select id="cd-status">${statusOpts}</select>
             <select id="cd-user">${filterOpts}</select>
             <button data-cd="search">搜索</button>
@@ -2286,7 +2286,7 @@
                 ? `<img class="thumb" src="${esc(r.coverURL)}" onerror="this.style.opacity=.15">`
                 : '<span class="muted">—</span>'}</td>
               <td><div class="cd-title">${esc(r.title) || '未命名'}</div>
-                <div class="cd-id">${esc(r.characterID)}</div></td>
+                <div class="cd-id">${esc(r.characterId)}</div></td>
               <td class="nowrap">${esc(r.user.name)}</td>
               <td>${badgeOf(r.status)}</td>
               <td class="nowrap">${r.worldbookCount}
@@ -2294,13 +2294,13 @@
               <td class="muted nowrap">${esc(fmtTime(r.updatedAt))}</td>
               <td class="cd-ops">
                 <button data-cd="detail" data-uid="${r.userId}"
-                  data-cid="${esc(r.characterID)}">查看</button>
+                  data-cid="${esc(r.characterId)}">查看</button>
                 <button data-cd="export-full" data-uid="${r.userId}"
-                  data-cid="${esc(r.characterID)}">导出</button>
+                  data-cid="${esc(r.characterId)}">导出</button>
                 <button data-cd="export-wb" data-uid="${r.userId}"
-                  data-cid="${esc(r.characterID)}">仅世界书</button>
+                  data-cid="${esc(r.characterId)}">仅世界书</button>
                 <button data-cd="delete" data-uid="${r.userId}"
-                  data-cid="${esc(r.characterID)}">删除</button>
+                  data-cid="${esc(r.characterId)}">删除</button>
               </td></tr>`)}
           <div class="toolbar" style="margin-top:12px">
             <button data-cd="prev"${Number(page.page || 1) <= 1 ? ' disabled' : ''}>上一页</button>
@@ -2317,12 +2317,12 @@
         <div class="panel">
           <h3>导入 JSON <span class="muted">· 作品信息 / 世界书</span></h3>
           <p class="muted small">支持本页导出的 <code>${esc(ov.schema || 'missai.creation/v1')}</code> 整包、
-            单个作品对象（<code>characterID</code> + 作品字段），以及只含世界书的
-            <code>{characterID, worldbook:[…]}</code>。导入前先「解析预览」确认会被写成什么。</p>
+            单个作品对象（<code>characterId</code> + 作品字段），以及只含世界书的
+            <code>{characterId, worldbook:[…]}</code>。导入前先「解析预览」确认会被写成什么。</p>
           <form id="cd-import-form" class="llm-form">
             <label>导入方式
               <select id="cd-mode">
-                <option value="merge"${cdMode === 'merge' ? ' selected' : ''}>合并（同 characterID 覆盖字段）</option>
+                <option value="merge"${cdMode === 'merge' ? ' selected' : ''}>合并（同 characterId 覆盖字段）</option>
                 <option value="replace"${cdMode === 'replace' ? ' selected' : ''}>整包覆盖（清掉该作品旧世界书）</option>
               </select>
             </label>
@@ -2340,7 +2340,7 @@
           </form>
           <label class="tpl-editor">作品 / 世界书 JSON
             <textarea id="cd-json" spellcheck="false"
-              placeholder='{"schema":"missai.creation/v1","works":[{"characterID":"char-xxx","payload":{"name":"作品名"},"worldbook":[{"entryId":"wb_1","custom":true,"payload":{"keys":["关键词"],"content":"设定内容"}}]}]}'>${esc(cdDraft)}</textarea>
+              placeholder='{"schema":"missai.creation/v1","works":[{"characterId":"char-xxx","payload":{"name":"作品名"},"worldbook":[{"entryId":"wb_1","custom":true,"payload":{"keys":["关键词"],"content":"设定内容"}}]}]}'>${esc(cdDraft)}</textarea>
           </label>
           ${pvHtml}
         </div>`;
@@ -2370,7 +2370,7 @@
         }
         if (act === 'export-full' || act === 'export-wb') {
           return window.open('/local/api/creation/export?' + new URLSearchParams({
-            userId: String(uid), characterID: cid,
+            userId: String(uid), characterId: cid,
             scope: act === 'export-wb' ? 'worldbook' : 'full',
           }).toString(), '_blank');
         }
@@ -2378,7 +2378,7 @@
           if (!window.confirm('删除这个作品和它的全部世界书？\n' + cid)) return;
           try {
             await dbPost('/local/api/creation/delete',
-              { userId: uid, characterID: cid, confirm: 'yes' });
+              { userId: uid, characterId: cid, confirm: 'yes' });
             cdMsg = { ok: true, text: '已删除 ' + cid };
             dbToast('已删除');
           } catch (err) {
@@ -2476,7 +2476,7 @@
         let out;
         try {
           out = await j('/local/api/creation/work?' + new URLSearchParams({
-            userId: String(uid2), characterID: cid2,
+            userId: String(uid2), characterId: cid2,
           }).toString());
         } catch (err) {
           return dbToast('读取作品失败：' + err.message, false);
@@ -2487,7 +2487,7 @@
         const statusText = { draft: '草稿', published: '已发布',
           scheduled: '定时发布', archived: '已归档' }[d.status] || d.status || '';
         const kv = [
-          ['characterID', d.characterID],
+          ['characterId', d.characterId],
           ['作者', (d.user || {}).name || ''],
           ['状态', statusText],
           ['标题', d.title],
@@ -2526,7 +2526,7 @@
             : '<div class="empty small">这件作品还没有世界书条目</div>'}
           <details class="cd-json-box"><summary>作品整包 JSON（payload）</summary>
             <pre class="cd-json">${esc(JSON.stringify(p, null, 2))}</pre></details>`;
-        dbModalOpen('作品 · ' + (d.title || d.characterID), body,
+        dbModalOpen('作品 · ' + (d.title || d.characterId), body,
           '<button type="button" class="btn ghost" data-modal-cancel>关闭</button>');
         const back = $('#db-modal');
         $$('[data-cd-modal]', back).forEach((b) => {
@@ -2534,7 +2534,7 @@
             const act = b.dataset.cdModal;
             if (act === 'export' || act === 'export-wb') {
               window.open('/local/api/creation/export?' + new URLSearchParams({
-                userId: String(uid2), characterID: cid2,
+                userId: String(uid2), characterId: cid2,
                 scope: act === 'export-wb' ? 'worldbook' : 'full',
               }).toString(), '_blank');
               return;

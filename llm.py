@@ -14,6 +14,7 @@ base_url 填官方 https://api.openai.com/v1，或任何兼容这套协议的中
 
 import json
 import random
+import sys
 import threading
 import time
 from email.utils import parsedate_to_datetime
@@ -388,6 +389,8 @@ def _chat_payload(model: str, messages: list[dict], stream: bool,
     stop = prof.get("stop")
     if stop:
         payload["stop"] = stop if isinstance(stop, list) else [stop]
+    # 覆盖顺序（有意为之）：profile.extra 在 temperature / max_tokens 之后应用，
+    # 因此接入级配置优先；随后 extra（调用方参数，如 top_p / 惩罚）再覆盖 profile.extra。
     if isinstance(prof.get("extra"), dict):
         payload.update(prof["extra"])
     payload.update({k: v for k, v in extra.items() if v is not None})
@@ -708,9 +711,54 @@ def _stream_once(url: str, api_key: str, payload: dict, timeout: float,
         raise LLMError("模型没有返回文本内容", code="empty", retryable=True)
 
 
+# 400 参数不兼容：按顺序摘参数重试（与 imagegen.py 的「被拒即摘」同一思路）。
+# 每一步只摘一次；全部摘完仍失败 → 不再重试，按原错误返回。
+PARAM_STRIP_STEPS = (
+    ("presence_penalty / frequency_penalty",
+     ("presence_penalty", "frequency_penalty")),
+    ("temperature / top_p", ("temperature", "top_p")),
+    ("max_tokens → max_completion_tokens", ("max_tokens",)),
+)
+_PARAM_NAMES = ("temperature", "top_p", "presence_penalty", "frequency_penalty",
+                "max_tokens", "max_completion_tokens")
+_PARAM_REJECT_HINTS = ("unsupported parameter", "unknown parameter",
+                       "unexpected parameter", "extra fields", "not supported",
+                       "does not support", "invalid parameter", "不支持")
+
+
+def _param_reject(exc: LLMError) -> bool:
+    """400 且错误信息指向「参数不支持」（上下文超限走自己的降级，不在这里摘）。"""
+    if exc.status != 400 or exc.code == "context_overflow":
+        return False
+    low = str(exc).lower()
+    if any(name in low for name in _PARAM_NAMES):
+        return True
+    return any(hint in low for hint in _PARAM_REJECT_HINTS)
+
+
+def _strip_param_step(payload: dict, done: set) -> str:
+    """按固定顺序摘掉一组参数；返回说明，None 表示没有可摘的。"""
+    for desc, keys in PARAM_STRIP_STEPS:
+        if desc in done:
+            continue
+        if not any(k in payload for k in keys):
+            continue
+        if desc.startswith("max_tokens"):
+            if "max_completion_tokens" in payload:
+                done.add(desc)
+                continue
+            payload["max_completion_tokens"] = payload.pop("max_tokens")
+        else:
+            for k in keys:
+                payload.pop(k, None)
+        done.add(desc)
+        return desc
+    return None
+
+
 def chat_stream(base_url: str, api_key: str, model: str, messages: list[dict],
                 timeout: float = FIRST_BYTE_TIMEOUT_STREAM,
-                temperature: float | None = 0.8,
+                temperature: float | None = 0.7,
                 max_tokens: int | None = None, on_send=None, should_stop=None,
                 on_finish=None, stream_key=None, profile: dict | None = None,
                 include_usage: bool = False, **extra):
@@ -739,6 +787,7 @@ def chat_stream(base_url: str, api_key: str, model: str, messages: list[dict],
     url_idx = 0
     attempt = 1
     empty_retried = False
+    strip_done: set[str] = set()          # 已摘过的参数组（每组只重试一次）
     while True:
         if should_stop and should_stop():
             on_finish and on_finish({"finish_reason": "stopped", "stopped": True})
@@ -757,6 +806,12 @@ def chat_stream(base_url: str, api_key: str, model: str, messages: list[dict],
             if exc.status == 404 and url_idx + 1 < len(urls):
                 url_idx += 1              # 只补一次 /v1，不算退避次数
                 continue
+            if _param_reject(exc):
+                desc = _strip_param_step(payload, strip_done)
+                if desc:
+                    print(f"[llm] 上游拒绝参数，摘掉 {desc} 后重试：{exc}",
+                          file=sys.stderr, flush=True)
+                    continue          # 不占网络重试次数，但每组只摘一次
             if attempt >= MAX_ATTEMPTS:
                 raise
             retry_ok = exc.retryable

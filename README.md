@@ -588,6 +588,24 @@ python selftest.py 4173   # 227 项，全绿输出「通过 227，失败 0」
 | `embeddingConfig/get`、`save`、`backfill` | **检索向量配置**：OpenAI 兼容 `base_url` / `api_key` / `model` / `dimensions` / 批量与超时；用户级优先、空则回落全局 `embeddingConfig:0`，`backfill` 后台补齐向量 |
 | `summaryConfig/getByCharacter`、`saveByCharacter` | **摘要参数**：开关 / 注入方式 / 保留轮数；按 `summaryConfig:{用户}:{characterID}` 存 `config_cache` |
 
+> **模型参数面板只管「正文那一轮」**：面板保存的 `temperature / topP / 惩罚 / maxTokens`
+> 只作用于用户对话的正文请求。后台三次调用仍是写死的参数，不受面板影响——
+> 格式补全（temperature 0.3 / max_tokens 300）、滚动摘要（max_tokens 900）、
+> 结构化记忆抽取（temperature 0.2 / max_tokens 600）。
+>
+> **下发规则**：未保存过配置时也按面板默认值真正下发（0.7 / 0.8 / 0 / 0），
+> 不再把 top_p / 惩罚交给上游默认值。`maxTokens` 的实际下发值为
+> `min(设定值, 上下文窗口 − 输入估算 − 64)`：输出预算最多占窗口 3/4（输入至少留 1/4，
+> 且不低于 512 token），所以「最大回复长度」调到窗口上限也不会挤掉输入、更不会关闭预裁剪。
+> 面板会显示上一轮真实下发值；被压低时后端日志另打一行 `[model] max_tokens 被上下文压低`。
+>
+> **保存校验**：数字越界钳制（温度 / Top-P / 惩罚 0–1，maxTokens 256–8192，
+> contextWindow 1024–32768）；非数字 / NaN / 无穷直接拒绝（`code:400`），GET 回填也钳制。
+>
+> **参数被上游拒绝（400）**：按顺序摘参重试——先摘 `presence_penalty / frequency_penalty`，
+> 再摘 `temperature / top_p`，最后 `max_tokens` 改名 `max_completion_tokens`；每组只摘一次，
+> 全部失败按原错误返回（正常触发退款）。
+
 > 这两组 GET 原本会被反代到线上 → 线上不认本地会话回 401 → 降级成 `data:{}`，
 > 前端拿到 `{}` 后直接 `value.toFixed()`，**「对话设置」一打开就报
 > `Cannot read properties of undefined (reading 'toFixed')`**。现在由 `Handler._local_prefs()`

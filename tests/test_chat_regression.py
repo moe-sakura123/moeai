@@ -12,14 +12,20 @@
 运行： python tests/test_chat_regression.py
 """
 import json
+import os
 import shutil
 import sys
 import tempfile
+import time
 import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
+# 回归不加载真实 bge 模型：指向不存在的目录，走关键词/哈希降级，避免拖慢用例
+os.environ["BGE_M3_PATH"] = str(ROOT / "models" / "__regression_missing")
+os.environ["BGE_RERANK_PATH"] = str(ROOT / "models" / "__regression_missing")
 
 import db  # noqa: E402
 import prompt_builder  # noqa: E402
@@ -376,17 +382,17 @@ def test_memory_slots(uid):
     payload = {"short_term": "近期剧情", "long_term": "长期事实",
                "user_info": "用户信息", "promise": "答应的事"}
     real = server.llm.chat_stream
-    real_params = server.Handler._summary_params
+    real_params = server.Handler._memory_enabled
     real_endpoint = server.Handler._llm_endpoint
     server.llm.chat_stream = lambda *a, **k: iter(
         [json.dumps(payload, ensure_ascii=False)])
-    server.Handler._summary_params = staticmethod(lambda _u, _c: (True, 3))
+    server.Handler._memory_enabled = staticmethod(lambda _u, _c: True)
     server.Handler._llm_endpoint = staticmethod(lambda _r: ("http://fake", "k", "m"))
     try:
         server.Handler._maybe_summarize(uid, view, CID)
     finally:
         server.llm.chat_stream = real
-        server.Handler._summary_params = real_params
+        server.Handler._memory_enabled = real_params
         server.Handler._llm_endpoint = real_endpoint
     slots = db.memory_slots(uid, view)
     st = db.summary_state(uid, view)
@@ -550,7 +556,7 @@ def test_algorithm_memory(uid):
           bool(msgs) and bool(msgs[1]["retrieved"]), msgs[1]["retrieved"][:1] if msgs else None)
     texts = [m["content"] for m in msgs[0]] if msgs else []
     check("检索块注入到 prompt",
-          any("### 相关记忆" in t for t in texts), texts[:2])
+          any("### 记忆召回" in t for t in texts), texts[:2])
     check("注入位置记录为配置深度",
           bool(msgs) and msgs[1]["retrieved"][0]["injected_at"] == 4,
           msgs[1]["retrieved"][:1] if msgs else None)
@@ -562,6 +568,117 @@ def test_algorithm_memory(uid):
     bumped = db.one("SELECT recall_count FROM chat_memory_items WHERE id=?",
                     (int(logs[0]["memory_id"]),))
     check("召回次数累加", bool(bumped) and int(bumped["recall_count"]) >= 1, bumped)
+
+    # 存量配置迁移：旧默认 waitMs=300/2500/8/800 不能把新默认值锁死
+    saved = dict(db.get_config(f"promptEngine:{uid}:{CID}") or {})
+    saved["memory"] = dict(saved.get("memory") or {})
+    old_recall = dict(saved["memory"].get("recall") or {})
+    saved["memory"]["recall"] = {"enabled": True, "waitMs": 300,
+                                 "totalTimeoutMs": 2500, "rerankTop": 8,
+                                 "singleTimeoutMs": 800}
+    db.set_config(f"promptEngine:{uid}:{CID}", saved)
+    migrated = server.Handler._memory_cfg(uid, CID)["recall"]
+    check("旧 recall 配置迁移到新默认",
+          migrated["waitMs"] == 8000 and migrated["totalTimeoutMs"] == 8000
+          and migrated["rerankTop"] == 20 and migrated["singleTimeoutMs"] == 1500
+          and migrated["version"] == 4, migrated)
+    # v2 存量：等于 v2 默认的速度项升级到 v4，用户真改过的（rerankTop=12）保留
+    saved["memory"]["recall"] = {"version": 2, "waitMs": 5000,
+                                 "totalTimeoutMs": 5500, "rerankTop": 12,
+                                 "singleTimeoutMs": 1500}
+    db.set_config(f"promptEngine:{uid}:{CID}", saved)
+    v2 = server.Handler._memory_cfg(uid, CID)["recall"]
+    check("v2 配置迁移：默认项升级、用户改过的 rerankTop 保留",
+          v2["waitMs"] == 8000 and v2["totalTimeoutMs"] == 8000
+          and v2["rerankTop"] == 12 and v2["version"] == 4, v2)
+    # v3 存量：仍是 v3 默认（6000/6000）的升级到 8000
+    saved["memory"]["recall"] = {"version": 3, "waitMs": 6000,
+                                 "totalTimeoutMs": 6000, "rerankTop": 20,
+                                 "singleTimeoutMs": 1500}
+    db.set_config(f"promptEngine:{uid}:{CID}", saved)
+    v3 = server.Handler._memory_cfg(uid, CID)["recall"]
+    check("v3 存量迁移：旧默认 6000 升到 8000",
+          v3["waitMs"] == 8000 and v3["totalTimeoutMs"] == 8000
+          and v3["version"] == 4, v3)
+    # v3 但用户自己把窗口改成 7000：迁移不能覆盖
+    saved["memory"]["recall"] = {"version": 3, "waitMs": 7000,
+                                 "totalTimeoutMs": 7000, "rerankTop": 20}
+    db.set_config(f"promptEngine:{uid}:{CID}", saved)
+    v3u = server.Handler._memory_cfg(uid, CID)["recall"]
+    check("v3 用户自设窗口保留",
+          v3u["waitMs"] == 7000 and v3u["totalTimeoutMs"] == 7000
+          and v3u["version"] == 4, v3u)
+    saved["memory"]["recall"] = old_recall
+    db.set_config(f"promptEngine:{uid}:{CID}", saved)
+
+    # 历史分段向量跨轮复用：只编码缓存里没有的新消息
+    calls = []
+
+    def _fake_encode(texts, **kw):
+        calls.append(list(texts))
+        return [[float(len(t)), 1.0, 0.0] for t in texts]
+
+    orig_emb, orig_enc = server.memory_recall._EMB, server.memory_recall.encode
+    server.memory_recall._EMB = object()
+    server.memory_recall.encode = _fake_encode
+    try:
+        server.memory_recall.segment_vector(["历史一", "本轮问题"])
+        server.memory_recall.segment_vector(["历史一", "本轮问题", "下一轮新问题"])
+    finally:
+        server.memory_recall._EMB, server.memory_recall.encode = orig_emb, orig_enc
+    check("分段向量跨轮复用，只编码新增消息",
+          calls == [["历史一", "本轮问题"], ["下一轮新问题"]], calls)
+
+    # 召回超时不阻塞：后台慢查询最多等 waitMs，超时改用关键词通道
+    def _new_ctx(text):
+        return ChatContext(session_id=sid, character_data=ctx.character_data,
+                           history=[], user_input=text)
+
+    slow_ctx = _new_ctx("下雨天 海边 承诺 还记得吗")
+    orig_recall = server.memory_recall.recall
+
+    def _slow_recall(query, u, c, sid=None, top_k=5, **ov):
+        if not ov.get("keyword_only"):
+            time.sleep(0.9)
+            return []
+        return orig_recall(query, u, c, sid=sid, top_k=top_k, **ov)
+
+    # 用例内显式收紧 waitMs（带 version=3：300 与 v3 默认 6000 不同，迁移会保留）
+    saved = dict(db.get_config(f"promptEngine:{uid}:{CID}") or {})
+    saved["memory"] = dict(saved.get("memory") or {})
+    saved["memory"]["recall"] = {**(saved["memory"].get("recall") or {}),
+                                 "waitMs": 300, "version": 3}
+    db.set_config(f"promptEngine:{uid}:{CID}", saved)
+    server.memory_recall.recall = _slow_recall
+    try:
+        t0 = time.monotonic()
+        slow_msgs = server.Handler._prompt_messages(uid, sid, CID, slow_ctx, None)
+        elapsed = time.monotonic() - t0
+    finally:
+        server.memory_recall.recall = orig_recall
+    check("召回超时最多等 waitMs 不阻塞", elapsed < 0.7, f"{elapsed:.3f}s")
+    check("超时后仍注入关键词结果",
+          bool(slow_msgs) and bool(slow_msgs[1]["retrieved"])
+          and slow_msgs[1]["retrieved"][0].get("recall_mode") == "关键词兜底",
+          slow_msgs[1]["retrieved"][:1] if slow_msgs else None)
+
+    # enabled=false：完全不注入记忆块
+    saved = db.get_config(f"promptEngine:{uid}:{CID}") or {}
+    saved = dict(saved)
+    saved["memory"] = dict(saved.get("memory") or {})
+    saved["memory"]["recall"] = {**(saved["memory"].get("recall") or {}),
+                                 "enabled": False}
+    db.set_config(f"promptEngine:{uid}:{CID}", saved)
+    off_msgs = server.Handler._prompt_messages(
+        uid, sid, CID, _new_ctx("下雨天 海边 关闭召回"), None)
+    off_texts = [m["content"] for m in off_msgs[0]] if off_msgs else []
+    check("enabled=false 不注入记忆块",
+          bool(off_msgs) and not off_msgs[1]["retrieved"]
+          and not any("### 记忆召回" in t or "### 相关记忆" in t
+                      for t in off_texts),
+          (off_msgs[1]["retrieved"][:1], off_texts[:1]) if off_msgs else None)
+    saved["memory"]["recall"]["enabled"] = True
+    db.set_config(f"promptEngine:{uid}:{CID}", saved)
 
     # 遗忘层：低重要度 + 长期未召回 → 归档（行保留）
     mid = int(db.memory_items(uid, CID, sid)[-1]["id"])
@@ -717,6 +834,127 @@ def test_stream_rollback():
           and turn.display_text.startswith("乙" * 2100), (n, turn.display_text[:8]))
 
 
+def test_model_params(uid):
+    """[14] 模型参数：默认值真下发 / max_tokens 预算 / 保存校验 / 400 摘参重试。"""
+    import llm
+    from roleplay_core.prompt import compress_for_budget, estimate_messages
+
+    print("[14] 模型参数：默认值 / 预算裁剪 / 校验 / 400 摘参")
+    mid = "9"
+    db.set_config(f"promptEngine:{uid}:{CID}", {})      # contextWindow 回落 8192
+    msgs = [{"role": "system", "content": "设定"},
+            {"role": "user", "content": "你好"}]
+
+    # a) 未保存过配置：四个参数按面板默认值真进请求体
+    params = server.Handler._model_params(uid, mid)
+    body = llm._chat_payload("m", msgs, True, params["temperature"],
+                             params["max_tokens"],
+                             {k: v for k, v in params.items()
+                              if k not in ("temperature", "max_tokens", "profile")},
+                             params.get("profile"))
+    check("未保存配置也下发默认值 0.7/0.8/0/0",
+          (body.get("temperature"), body.get("top_p"), body.get("presence_penalty"),
+           body.get("frequency_penalty")) == (0.7, 0.8, 0.0, 0.0),
+          {k: body.get(k) for k in ("temperature", "top_p",
+                                    "presence_penalty", "frequency_penalty")})
+    sent_tokens = body.get("max_tokens") or body.get("max_completion_tokens")
+    check("未保存配置 max_tokens 默认 8192", sent_tokens == 8192, sent_tokens)
+
+    # b) maxTokens=8192（上限）也不会把预裁剪关掉：输出预算仍给输入留窗口 1/4
+    db.set_config(f"modelConfig:{uid}:{mid}",
+                  {"maxTokens": 8192, "contextWindow": 8192})
+    budget = server.Handler._output_budget(uid, mid)
+    target = 8192 - budget - 64
+    check("maxTokens 上限时输入预算仍为正", target >= 512, (budget, target))
+    history = [{"role": "system", "content": "设定"}] + [
+        {"role": "user" if i % 2 == 0 else "assistant",
+         "content": "会被裁掉的历史对话内容，用来测试输入预算。" * 4 + str(i)}
+        for i in range(200)]
+    before = estimate_messages(history)
+    trimmed = compress_for_budget(history, target, 6)
+    after = estimate_messages(trimmed)
+    check("输入超预算时被确定性裁剪", before > target >= after, (before, target, after))
+    p2 = server.Handler._model_params(uid, mid, trimmed)
+    expect = max(256, min(8192, 8192 - after - 64))
+    check("面板展示值 = 真实下发值（被压低）",
+          p2["max_tokens"] == expect and p2["max_tokens"] < 8192,
+          (p2["max_tokens"], expect))
+    # 保存合并：只改模型参数不冲掉同键的 contextWindow
+    cur = db.get_config(f"modelConfig:{uid}:{mid}") or {}
+    cur.update({"temperature": 0.5})
+    db.set_config(f"modelConfig:{uid}:{mid}", cur)
+    check("保存参数不清掉同键 contextWindow",
+          (db.get_config(f"modelConfig:{uid}:{mid}") or {}).get("contextWindow") == 8192)
+
+    # c) 保存校验：非法值整包拒绝，越界钳制，GET 回填也钳制
+    keep, err = server.Handler._model_config_clean(
+        {"temperature": "abc"}, strict=True)
+    check("字符串值被拒绝", keep == {} and bool(err), (keep, err))
+    keep, err = server.Handler._model_config_clean(
+        {"topP": float("nan")}, strict=True)
+    check("NaN 被拒绝", keep == {} and bool(err), (keep, err))
+    keep, _ = server.Handler._model_config_clean(
+        {"temperature": -2, "topP": 3, "maxTokens": 99999}, strict=True)
+    check("越界钳制到范围内",
+          keep == {"temperature": 0.0, "topP": 1.0, "maxTokens": 8192}, keep)
+    keep, _ = server.Handler._model_config_clean({"maxTokens": 1}, strict=True)
+    check("maxTokens 下限钳到 256", keep.get("maxTokens") == 256, keep)
+    keep, _ = server.Handler._model_config_clean({"contextWindow": 99999})
+    check("GET 回填钳制到 32768", keep.get("contextWindow") == 32768, keep)
+
+    # d) 400 参数不兼容：按「惩罚 → temperature/top_p → max_tokens」逐组摘参重试
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    seen = []
+
+    class Stub(BaseHTTPRequestHandler):
+        def log_message(self, *a):                       # noqa: D401
+            pass
+
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            seen.append(json.loads(raw or b"{}"))
+            msg = {1: "Unsupported parameter: presence_penalty",
+                   2: "invalid parameter: temperature is not supported",
+                   3: "Unsupported parameter: max_tokens"}.get(len(seen), "")
+            if msg:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": {"message": msg}}).encode())
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            for f in ({"choices": [{"delta": {"content": "你好"},
+                                    "finish_reason": ""}]},
+                      {"choices": [{"delta": {}, "finish_reason": "stop"}]}):
+                self.wfile.write(("data: " + json.dumps(f, ensure_ascii=False)
+                                  + "\n\n").encode())
+            self.wfile.write(b"data: [DONE]\n\n")
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Stub)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        out = "".join(llm.chat_stream(
+            f"http://127.0.0.1:{srv.server_address[1]}", "k", "m", msgs,
+            timeout=10.0, temperature=0.7, top_p=0.8, presence_penalty=0.0,
+            frequency_penalty=0.0, max_tokens=8192))
+    finally:
+        srv.shutdown()
+    check("400 摘参后最终请求成功", out == "你好" and len(seen) == 4,
+          (out, len(seen)))
+    check("第一步摘惩罚参数",
+          "presence_penalty" not in seen[1] and "frequency_penalty" not in seen[1],
+          seen[1])
+    check("第二步摘 temperature/top_p",
+          "temperature" not in seen[2] and "top_p" not in seen[2], seen[2])
+    check("第三步 max_tokens 换 max_completion_tokens",
+          "max_tokens" not in seen[3]
+          and seen[3].get("max_completion_tokens") == 8192, seen[3])
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="missai-regression-")
     try:
@@ -734,6 +972,7 @@ def main():
         test_provider_profile(uid)
         test_algorithm_memory(uid)
         test_memory_embedding(uid)
+        test_model_params(uid)
     finally:
         conn = getattr(db._local, "conn", None)
         if conn is not None:

@@ -40,7 +40,35 @@ UPLOAD_DIR = ROOT / "html" / "image"      # 上传图片统一落到 html/image/
 # 这些表是控制台的“骨架”，清空 / 删除所有表时必须保留
 SYSTEM_TABLES = ("meta", "db_op_log", "users", "sessions")
 # 清空数据时额外保留模型接入配置（聊天 + 绘图 + 视频）
-PROTECTED_CLEAR = SYSTEM_TABLES + ("llm_providers", "image_providers", "video_providers")
+PROTECTED_CLEAR = SYSTEM_TABLES + ("model_providers",)
+# 模型接入三表合一：model_providers 为唯一物理表，旧表名保留为视图 + 写兼容触发器。
+# kind 仍表示预设键（openai/dashscope/...），model_type 才是「聊天/绘图/视频」的分流键。
+_PROVIDER_BASE_COLS = (
+    ("kind", "'openai'"),
+    ("name", "''"),
+    ("base_url", "''"),
+    ("api_key", "''"),
+    ("models", "'[]'"),
+    ("status", "'unknown'"),
+    ("last_error", "''"),
+    ("last_check_at", "NULL"),
+    ("enabled", "1"),
+    ("is_default", "0"),
+    ("default_model", "''"),
+    ("created_at", "''"),
+    ("updated_at", "''"),
+)
+_PROVIDER_EXTRA_COLS = {
+    "llm": (("profile", "'{}'"),),
+    "image": (("sizes", "'[\"1024x1024\",\"1024x1536\",\"1536x1024\"]'"),
+              ("extra", "'{}'")),
+    "video": (("specs", "'[\"5s\",\"10s\"]'"), ("extra", "'{}'")),
+}
+_PROVIDER_TABLES = {
+    "llm": "llm_providers",
+    "image": "image_providers",
+    "video": "video_providers",
+}
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 SCHEMA_VERSION = 1
@@ -75,6 +103,124 @@ def get_conn() -> sqlite3.Connection:
         _local.conn = conn
         _local.conn_path = want
     return conn
+
+
+def _migrate_model_providers(conn: sqlite3.Connection) -> None:
+    """把三张旧接入表合并进 model_providers；旧表名改建成可读写视图。
+
+    幂等：旧表已迁完时只重建视图；重复执行不会重复插入，也不会报错。
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS model_providers (
+            model_type    TEXT NOT NULL,
+            id            INTEGER NOT NULL,
+            kind          TEXT NOT NULL DEFAULT 'openai',
+            name          TEXT NOT NULL DEFAULT '',
+            base_url      TEXT NOT NULL DEFAULT '',
+            api_key       TEXT NOT NULL DEFAULT '',
+            models        TEXT NOT NULL DEFAULT '[]',
+            status        TEXT NOT NULL DEFAULT 'unknown',
+            last_error    TEXT DEFAULT '',
+            last_check_at TEXT,
+            enabled       INTEGER NOT NULL DEFAULT 1,
+            is_default    INTEGER NOT NULL DEFAULT 0,
+            default_model TEXT DEFAULT '',
+            profile       TEXT NOT NULL DEFAULT '{}',
+            sizes         TEXT NOT NULL DEFAULT '["1024x1024","1024x1536","1536x1024"]',
+            specs         TEXT NOT NULL DEFAULT '["5s","10s"]',
+            extra         TEXT NOT NULL DEFAULT '{}',
+            created_at    TEXT NOT NULL DEFAULT '',
+            updated_at    TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (model_type, id)
+        )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_model_providers"
+                 " ON model_providers(model_type, is_default DESC, id)")
+
+    for mtype, table in _PROVIDER_TABLES.items():
+        extra = _PROVIDER_EXTRA_COLS[mtype]
+        cols_with_default = list(_PROVIDER_BASE_COLS) + list(extra)
+        obj = conn.execute("SELECT type FROM sqlite_master WHERE name=?",
+                           (table,)).fetchone()
+        # 1) 旧物理表 → 搬数据后删除（只在还是 table 时执行）
+        if obj and obj["type"] == "table":
+            old_cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            names = ",".join(c for c, _ in cols_with_default)
+            selects = ",".join(c if c in old_cols else d for c, d in cols_with_default)
+            conn.execute(
+                f"INSERT OR IGNORE INTO model_providers(model_type,id,{names})"
+                f" SELECT ?,id,{selects} FROM {table}", (mtype,))
+            conn.execute(f"DROP TABLE {table}")
+
+        # 2) 旧表名 → 视图（顺序与旧表一致）
+        view_cols = ["id"] + [c for c, _ in cols_with_default]
+        conn.execute(f"DROP VIEW IF EXISTS {table}")
+        conn.execute(f"CREATE VIEW {table} AS SELECT {','.join(view_cols)}"
+                     f" FROM model_providers WHERE model_type='{mtype}'")
+
+        # 3) 写兼容：INSTEAD OF 触发器把旧 SQL 转到新表
+        defaults = dict(cols_with_default)
+        data_cols = [c for c in view_cols if c != "id"]
+        ins_vals = ", ".join(
+            f"COALESCE(NEW.{c},{defaults[c]})" if defaults[c] != "NULL" else f"NEW.{c}"
+            for c in data_cols)
+        conn.execute(
+            f"CREATE TRIGGER IF NOT EXISTS {table}_ins INSTEAD OF INSERT ON {table} BEGIN "
+            f"INSERT INTO model_providers(model_type,id,{','.join(data_cols)})"
+            f" VALUES('{mtype}',"
+            f" COALESCE(NEW.id,(SELECT COALESCE(MAX(id),0)+1 FROM model_providers"
+            f" WHERE model_type='{mtype}')), {ins_vals}); END")
+        set_vals = ", ".join(
+            f"{c}=COALESCE(NEW.{c},{defaults[c]})" if defaults[c] != "NULL" else f"{c}=NEW.{c}"
+            for c in data_cols)
+        conn.execute(
+            f"CREATE TRIGGER IF NOT EXISTS {table}_upd INSTEAD OF UPDATE ON {table} BEGIN "
+            f"UPDATE model_providers SET {set_vals}"
+            f" WHERE model_type='{mtype}' AND id=OLD.id; END")
+        conn.execute(
+            f"CREATE TRIGGER IF NOT EXISTS {table}_del INSTEAD OF DELETE ON {table} BEGIN "
+            f"DELETE FROM model_providers WHERE model_type='{mtype}' AND id=OLD.id; END")
+
+
+def _migrate_chat_memories(conn: sqlite3.Connection) -> int:
+    """旧 chat_memories → chat_memory_items 一次性回填（幂等）。
+
+    以 source_turn='legacy:chat_memories:<id>' 作为迁移标记，重复执行只补新行。
+    旧表保留不删，仍可只读兼容。
+    """
+    names = {r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    if "chat_memories" not in names or "chat_memory_items" not in names:
+        return 0
+    rows = conn.execute(
+        "SELECT m.* FROM chat_memories m WHERE NOT EXISTS ("
+        " SELECT 1 FROM chat_memory_items i"
+        " WHERE i.source_turn='legacy:chat_memories:'||m.id)"
+        " ORDER BY m.id").fetchall()
+    n = 0
+    for r in rows:
+        content = str(r["content"] or "").strip()
+        if not content:
+            continue
+        ts = str(r["created_at"] or "") or now_iso()
+        h = hashlib.sha1(re.sub(r"\s+", " ", content.lower()).encode("utf-8")).hexdigest()
+        cur = conn.execute(
+            "INSERT INTO chat_memory_items(user_id, character_id, session_id,"
+            " kind, content, subject, object, importance, confidence,"
+            " source_turn, source_msg_ids, status, hash, created_at, updated_at)"
+            " VALUES(?,?,?,?,?, '', '', 0.6, 0.8, ?, '[]', 'active', ?, ?, ?)",
+            (r["user_id"], str(r["character_id"] or ""),
+             str(r["session_id"] or ""), "summary", content,
+             f"legacy:chat_memories:{int(r['id'])}", h, ts, ts))
+        mid = int(cur.lastrowid or 0)
+        if mid:
+            try:
+                conn.execute(
+                    "INSERT INTO chat_memory_fts(memory_id, content, subject, object)"
+                    " VALUES(?,?, '', '')", (mid, content))
+            except sqlite3.OperationalError:
+                pass
+        n += 1
+    return n
 
 
 def init() -> None:
@@ -300,6 +446,46 @@ def init() -> None:
             dim       INTEGER NOT NULL,
             vec       BLOB NOT NULL,
             PRIMARY KEY(memory_id, model)
+        );
+
+        -- 本地 LSA embedding：模型元信息 / 词项与 IDF / 训练状态
+        -- 向量本体仍存 chat_memory_vectors(model='local-lsa:vN')
+        CREATE TABLE IF NOT EXISTS local_embed_models (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            name         TEXT NOT NULL DEFAULT 'local-lsa',
+            version      INTEGER NOT NULL DEFAULT 1,
+            kind         TEXT NOT NULL DEFAULT 'local',
+            dim          INTEGER NOT NULL DEFAULT 0,
+            corpus_count INTEGER NOT NULL DEFAULT 0,
+            term_count   INTEGER NOT NULL DEFAULT 0,
+            source       TEXT NOT NULL DEFAULT 'memory',
+            params_json  TEXT NOT NULL DEFAULT '{}',
+            active       INTEGER NOT NULL DEFAULT 1,
+            trained_at   TEXT NOT NULL DEFAULT '',
+            elapsed_ms   INTEGER NOT NULL DEFAULT 0,
+            created_at   TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_local_model_active
+            ON local_embed_models(name, active, id DESC);
+
+        CREATE TABLE IF NOT EXISTS local_embed_terms (
+            model_id INTEGER NOT NULL,
+            term     TEXT NOT NULL,
+            df       INTEGER NOT NULL DEFAULT 0,
+            idf      REAL NOT NULL DEFAULT 0,
+            vec      BLOB NOT NULL,          -- 该词项在 k 个主题轴上的分量（float32）
+            PRIMARY KEY(model_id, term)
+        );
+        CREATE INDEX IF NOT EXISTS idx_local_term_model
+            ON local_embed_terms(model_id);
+
+        CREATE TABLE IF NOT EXISTS local_embed_state (
+            model_id        INTEGER PRIMARY KEY,
+            last_train_at    TEXT NOT NULL DEFAULT '',
+            last_project_at  TEXT NOT NULL DEFAULT '',
+            projected_count  INTEGER NOT NULL DEFAULT 0,
+            corpus_at_train  INTEGER NOT NULL DEFAULT 0,
+            updated_at       TEXT NOT NULL DEFAULT ''
         );
 
         CREATE TABLE IF NOT EXISTS chat_memory_recall_log (
@@ -778,6 +964,10 @@ def init() -> None:
     if "profile" not in pcols:
         conn.execute("ALTER TABLE llm_providers ADD COLUMN profile TEXT"
                      " NOT NULL DEFAULT '{}'")
+    # 三张接入表 → model_providers（旧表名由本函数改建为视图，可重复执行）
+    _migrate_model_providers(conn)
+    # 旧记忆摘要 → 结构化记忆表（幂等；旧表保留只读）
+    _migrate_chat_memories(conn)
 
     # 记忆向量：旧表是「一条记忆一个 JSON 向量」→ 重建为「记忆 × 模型」float32
     vcols = {r["name"] for r in conn.execute(
@@ -2361,7 +2551,8 @@ def _rebuild(path: str, qs: str) -> dict | None:
         # 详情接口用 name / summary / coverURL，榜单位用 characterName / characterName 封面，
         # 这里把两套叫法补齐，前端怎么读都有字
         single = dict(single)
-        single["characterID"] = single.get("characterID") or picked["character_id"]
+        single.pop("characterID", None)
+        single["characterId"] = single.get("characterId") or picked["character_id"]
         if not single.get("name"):
             single["name"] = single.get("characterName") or single.get("title") or ""
         if not single.get("characterName"):
@@ -2491,12 +2682,6 @@ def asset_get(path: str):
     return None
 
 
-def asset_count() -> int:
-    _ensure_assets()
-    row = one(f"SELECT COUNT(*) AS n FROM {ASSETS_TABLE}")
-    return int((row or {}).get("n") or 0)
-
-
 # ---------------------------------------------------------------- 角色详情（/profile）
 CHAR_TABLE = "character_details"
 
@@ -2543,19 +2728,6 @@ def character_get(character_id: str):
         except (TypeError, ValueError):
             return None
     return None
-
-
-def character_count() -> int:
-    _ensure_characters()
-    row = one(f"SELECT COUNT(*) AS n FROM {CHAR_TABLE}")
-    return int((row or {}).get("n") or 0)
-
-
-def character_ids(limit: int = 200) -> list[str]:
-    _ensure_characters()
-    rows = query(f"SELECT character_id FROM {CHAR_TABLE} ORDER BY fetched_at DESC LIMIT ?", (limit,))
-    return [r["character_id"] for r in rows]
-
 
 
 def list_works(limit: int = 100, offset: int = 0, q: str = "") -> list[dict]:
@@ -3591,10 +3763,11 @@ def _as_dict(payload) -> dict:
 
 
 def work_identity(payload: dict) -> str:
-    """作品在接口里的主键（POST /work 的 body 用 characterID）"""
+    """作品在接口里的主键（对外字段 characterId，兼容旧写法）"""
     if not isinstance(payload, dict):
         return ""
-    return str(payload.get("characterID") or payload.get("characterId")
+    return str(payload.get("characterId") or payload.get("characterID")
+               or payload.get("character_id")
                or payload.get("workID") or "").strip()
 
 
@@ -3615,7 +3788,8 @@ def save_work(user_id: int, payload: dict, status: str | None = None) -> dict | 
         final = "draft"
 
     now = now_iso()
-    merged["characterID"] = cid
+    merged.pop("characterID", None)
+    merged["characterId"] = cid
     merged["publishStatus"] = final
     merged["updatedAt"] = now
     blob = json.dumps(merged, ensure_ascii=False)
@@ -3638,20 +3812,30 @@ def save_work(user_id: int, payload: dict, status: str | None = None) -> dict | 
 def get_work(user_id: int, character_id: str) -> dict | None:
     row = one("SELECT payload FROM my_works WHERE user_id=? AND character_id=?",
               (user_id, character_id))
-    return _as_dict(row["payload"]) if row else None
+    return _normalize_cid(_as_dict(row["payload"])) if row else None
 
 
 def find_work(character_id: str) -> dict | None:
-    """任何用户本地建的作品（profile 页按 characterID 找详情用）"""
+    """任何用户本地建的作品（profile 页按 characterId 找详情用）"""
     row = one("SELECT payload FROM my_works WHERE character_id=? LIMIT 1",
               (str(character_id or "").strip(),))
-    return _as_dict(row["payload"]) if row else None
+    return _normalize_cid(_as_dict(row["payload"])) if row else None
+
+
+def _normalize_cid(payload: dict) -> dict:
+    """存量 payload 只有 characterID：读出来时补一份 characterId（不改库）"""
+    if isinstance(payload, dict) and "characterID" in payload \
+            and not payload.get("characterId"):
+        payload = dict(payload)
+        payload["characterId"] = payload["characterID"]
+    return payload
 
 
 def work_as_character(payload: dict) -> dict:
     """把创作页存的整包拼成 profile 页要的 data.character 形状"""
-    ch = dict(payload or {})
-    ch.setdefault("characterID", ch.get("characterId") or "")
+    ch = _normalize_cid(dict(payload or {}))
+    ch.setdefault("characterId", ch.get("characterID") or "")
+    ch.pop("characterID", None)
     name = str(ch.get("name") or "")
     ch["characterName"] = name
     ch.setdefault("summary", "")
@@ -3679,7 +3863,7 @@ def work_as_character(payload: dict) -> dict:
         ch["creator"] = {"ID": 0, "name": str(ch.get("authorName") or "本地作者"),
                          "userName": "本地作者", "nickName": "本地作者",
                          "avatar": "", "charactersCount": 0, "followersCount": 0,
-                         "characterID": ch.get("characterID")}
+                         "characterId": ch.get("characterId")}
     return ch
 
 
@@ -3706,8 +3890,8 @@ def list_my_works(user_id: int, page: int = 1, page_size: int = 10,
         payload = _as_dict(r["payload"])
         items.append({
             "ID": r["character_id"],
-            "id": r["character_id"], "characterID": r["character_id"],
-            "characterId": r["character_id"], "workID": r["character_id"],
+            "id": r["character_id"], "characterId": r["character_id"],
+            "workID": r["character_id"],
             "name": r["title"] or "", "title": r["title"] or "",
             "summary": r["summary"] or "",
             "avatarURL": r["cover_url"] or "", "coverURL": r["cover_url"] or "",
@@ -3750,7 +3934,7 @@ def delete_work(user_id: int, character_id: str) -> bool:
 def set_work_status(user_id: int, character_id: str, status: str,
                     scheduled_at: str | None = None) -> dict | None:
     """发布 / 下架 / 定时发布 → 改状态并回整包（前端会读 data.updatedAt）"""
-    payload = get_work(user_id, character_id) or {"characterID": character_id}
+    payload = get_work(user_id, character_id) or {"characterId": character_id}
     payload["publishStatus"] = status if status in WORK_STATUSES else "draft"
     if scheduled_at is not None:
         payload["scheduledPublishAt"] = scheduled_at
@@ -3794,7 +3978,7 @@ def publish_to_public(user_id: int, character_id: str) -> bool:
     except Exception:  # noqa: BLE001
         pass
     raw_item = {
-        "characterID": character_id,
+        "characterId": character_id,
         "name": name, "characterName": ch.get("characterName") or name,
         "summary": summary, "description": ch.get("description") or "",
         "coverURL": cover, "avatarURL": ch.get("avatarURL") or cover,
@@ -4066,7 +4250,11 @@ def save_llm_provider(payload: dict) -> dict | None:
 
 
 def delete_llm_provider(pid) -> bool:
-    return bool(execute("DELETE FROM llm_providers WHERE id=?", (int(pid),)))
+    # 视图 + INSTEAD OF 触发器下 rowcount 恒为 0，改用存在性判断
+    if not one("SELECT id FROM llm_providers WHERE id=?", (int(pid),)):
+        return False
+    execute("DELETE FROM llm_providers WHERE id=?", (int(pid),))
+    return True
 
 
 def set_llm_models(pid, models: list[str], status: str, error: str = "",
@@ -4412,7 +4600,10 @@ def save_image_provider(payload: dict) -> dict | None:
 
 
 def delete_image_provider(pid) -> bool:
-    return bool(execute("DELETE FROM image_providers WHERE id=?", (int(pid),)))
+    if not one("SELECT id FROM image_providers WHERE id=?", (int(pid),)):
+        return False
+    execute("DELETE FROM image_providers WHERE id=?", (int(pid),))
+    return True
 
 
 def set_image_models(pid, models: list[str], status: str, error: str = "",
@@ -4609,7 +4800,10 @@ def save_video_provider(payload: dict) -> dict | None:
 
 
 def delete_video_provider(pid) -> bool:
-    return bool(execute("DELETE FROM video_providers WHERE id=?", (int(pid),)))
+    if not one("SELECT id FROM video_providers WHERE id=?", (int(pid),)):
+        return False
+    execute("DELETE FROM video_providers WHERE id=?", (int(pid),))
+    return True
 
 
 def set_video_models(pid, models: list[str], status: str, error: str = "",
@@ -4821,8 +5015,8 @@ def list_worldbook(user_id: int, character_id: str, custom: bool = False) -> lis
         payload = _as_dict(r["payload"])
         payload.setdefault("ID", r["entry_id"])
         payload.setdefault("worldbookID", r["entry_id"])
-        payload.setdefault("characterID", character_id)
         payload["characterId"] = character_id
+        payload.pop("characterID", None)
         keys = payload.get("keys")
         if isinstance(keys, list):               # 读回时要 {keys:[...]}
             payload["keys"] = {"keys": keys}
@@ -4897,8 +5091,8 @@ def save_worldbook_entry(user_id: int, payload: dict, custom: bool = False,
         merged.setdefault("worldbookID", eid)
     merged["id"] = merged.get("id") or eid
     if cid:
-        merged["characterID"] = cid
         merged["characterId"] = cid
+        merged.pop("characterID", None)
     # 世界书字段落地（旧 payload 没写 → 写回时补默认值，便于引擎直接读）
     merged.setdefault("constant", False)
     merged.setdefault("probability", 100)
@@ -5375,7 +5569,7 @@ def creation_works(user_id: int = 0, q: str = "", status: str = "",
             "user": {"id": int(r["user_id"]),
                      "name": r.get("nick_name") or r.get("user_name")
                              or f"用户 #{r['user_id']}"},
-            "characterID": r["character_id"],
+            "characterId": r["character_id"],
             "status": r.get("status"),
             "title": r.get("title") or "",
             "summary": r.get("summary") or "",
@@ -5412,7 +5606,7 @@ def creation_work_detail(user_id: int, character_id: str) -> dict | None:
         "user": {"id": int(user_id),
                  "name": user.get("nick_name") or user.get("user_name")
                          or f"用户 #{user_id}"},
-        "characterID": row["character_id"],
+        "characterId": row["character_id"],
         "status": row.get("status"),
         "title": row.get("title") or "",
         "summary": row.get("summary") or "",
@@ -5454,7 +5648,7 @@ def creation_export(user_id: int = 0, character_ids: list | None = None,
             continue
         entries_total += len(detail["worldbook"])
         item = {k: detail[k] for k in (
-            "user", "userId", "characterID", "status", "title", "summary",
+            "user", "userId", "characterId", "status", "title", "summary",
             "coverURL", "scheduledAt", "createdAt", "updatedAt", "worldbook")}
         if scope == "full":
             item["payload"] = detail["payload"]
@@ -5513,7 +5707,7 @@ def _creation_pack(obj: dict) -> dict:
     return {
         "user": obj.get("user") if isinstance(obj.get("user"), dict) else None,
         "userId": int(obj.get("userId") or 0),
-        "characterID": cid,
+        "characterId": cid,
         "status": str(obj.get("status") or ""),
         "body": bool(body or isinstance(obj.get("payload"), dict)),
         "payload": payload,
@@ -5523,10 +5717,10 @@ def _creation_pack(obj: dict) -> dict:
 
 
 def _creation_merge(items: list[dict]) -> list[dict]:
-    """同一 characterID 的多条记录（作品 + 若干条目）合并成一条"""
+    """同一 characterId 的多条记录（作品 + 若干条目）合并成一条"""
     merged, index = [], {}
     for it in items:
-        cid = it.get("characterID") or ""
+        cid = it.get("characterId") or it.get("characterID") or ""
         if cid and cid in index:
             tgt = index[cid]
             tgt["worldbook"].extend(it.get("worldbook") or [])
@@ -5545,9 +5739,9 @@ def _creation_merge(items: list[dict]) -> list[dict]:
 def _creation_normalize(data) -> tuple[list[dict], list[str]]:
     """把各种形状的导入数据归一成 [作品]：
 
-    - 控制台导出的整包：{schema, works:[{characterID, payload, worldbook:[…]}]}
-    - 单个作品对象：{characterID|characterId|workID, name, firstMes, …}
-    - 只有世界书：{characterID, worldbook / entries:[…]} 或裸条目数组（需带 characterID）
+    - 控制台导出的整包：{schema, works:[{characterId, payload, worldbook:[…]}]}
+    - 单个作品对象：{characterId|workID, name, firstMes, …}
+    - 只有世界书：{characterId, worldbook / entries:[…]} 或裸条目数组（需带 characterId）
     """
     warnings: list[str] = []
     if isinstance(data, str):
@@ -5557,14 +5751,14 @@ def _creation_normalize(data) -> tuple[list[dict], list[str]]:
         if isinstance(works, list):
             items = [_creation_pack(w) for w in works if isinstance(w, dict)]
         elif _looks_like_entry(data):
-            warnings.append("文件里只有一条世界书条目，缺少所属作品的 characterID")
+            warnings.append("文件里只有一条世界书条目，缺少所属作品的 characterId")
             items = []
         else:
             items = [_creation_pack(data)]
     elif isinstance(data, list):
         items = [_creation_pack(x) for x in data if isinstance(x, dict)]
-        if items and all(not x["body"] and not x["characterID"] for x in items):
-            warnings.append("文件是裸世界书条目数组，缺少所属作品的 characterID")
+        if items and all(not x["body"] and not x["characterId"] for x in items):
+            warnings.append("文件是裸世界书条目数组，缺少所属作品的 characterId")
             items = []
     else:
         raise ValueError("不是可识别的 JSON 结构（要对象或数组）")
@@ -5580,7 +5774,7 @@ def creation_preview(data) -> dict:
         payload = it["payload"] if it["body"] else {}
         title = str(payload.get("name") or payload.get("characterName") or "")
         out["items"].append({
-            "characterID": it["characterID"] or "（缺 characterID）",
+            "characterId": it["characterId"] or "（缺 characterId）",
             "title": title or "（只导世界书）",
             "status": it["status"] or "—",
             "body": bool(it["body"]),
@@ -5598,7 +5792,8 @@ def replace_work(user_id: int, character_id: str, payload: dict) -> dict | None:
     if not cid:
         return None
     payload = dict(payload or {})
-    payload["characterID"] = cid
+    payload.pop("characterID", None)
+    payload["characterId"] = cid
     status = str(payload.get("publishStatus") or "").strip()
     if status not in WORK_STATUSES:
         status = "draft"
@@ -5624,7 +5819,7 @@ def replace_work(user_id: int, character_id: str, payload: dict) -> dict | None:
 
 def creation_import(data, mode: str = "merge", target_user_id: int = 0,
                     actor_id: int | None = None) -> dict:
-    """导入创作数据：mode=merge 合并（同 characterID 覆盖字段）/ replace 整包覆盖。
+    """导入创作数据：mode=merge 合并（同 characterId 覆盖字段）/ replace 整包覆盖。
 
     归属用户优先级：target_user_id > 文件里的 userId > actor_id > 第一个管理员。
     """
@@ -5647,12 +5842,13 @@ def creation_import(data, mode: str = "merge", target_user_id: int = 0,
         if not uid:
             report["skipped"].append("没有可写入的用户")
             continue
-        cid = it["characterID"]
+        cid = it["characterId"]
         if not cid:
             cid = f"char-{secrets.token_hex(8)}"
-            report["warnings"].append(f"作品缺 characterID，已生成 {cid}")
+            report["warnings"].append(f"作品缺 characterId，已生成 {cid}")
         payload = dict(it["payload"] or {})
-        payload["characterID"] = cid
+        payload.pop("characterID", None)
+        payload["characterId"] = cid
         status = it["status"] if it["status"] in WORK_STATUSES else ""
         existing = one("SELECT 1 AS ok FROM my_works WHERE user_id=? AND character_id=?",
                        (uid, cid))
@@ -5676,14 +5872,15 @@ def creation_import(data, mode: str = "merge", target_user_id: int = 0,
         for raw in entries:
             inner = raw.get("payload") if isinstance(raw.get("payload"), dict) else raw
             entry = dict(inner)
-            entry["characterID"] = cid
+            entry.pop("characterID", None)
+            entry["characterId"] = cid
             eid = str(raw.get("entryId") or entry.get("entryId") or ""
                       or entry.get("worldbookID") or entry.get("id") or "").strip()
             custom = bool(raw.get("custom")) if "custom" in raw \
                 else bool(entry.get("custom"))
             if save_worldbook_entry(uid, entry, custom=custom, entry_id=eid):
                 report["entries"] += 1
-        report["items"].append({"characterID": cid,
+        report["items"].append({"characterId": cid,
                                 "title": str(payload.get("name") or "")[:80],
                                 "worldbook": len(entries)})
     return report
@@ -5821,7 +6018,7 @@ def _thread_view(row: dict) -> dict:
     preview = re.sub(r"\s+", " ", preview).strip()[:80]
     return {
         "sessionId": sid, "id": sid,
-        "characterId": cid, "characterID": cid,
+        "characterId": cid,
         "characterName": name,
         "title": title, "preview": preview, "lastMessage": preview,
         "avatarUrl": meta["avatarUrl"] if known else (row.get("avatar_url") or meta["avatarUrl"]),
@@ -5830,6 +6027,48 @@ def _thread_view(row: dict) -> dict:
         "createdAt": row.get("created_at") or now_iso(),
         "updatedAt": row.get("updated_at") or now_iso(),
     }
+
+
+def list_chat_memories(user_id: int | None, character_id: str,
+                       session_id: str | None = None,
+                       limit: int = 300) -> list[dict]:
+    """记忆区列表（新表 chat_memory_items，升序）。
+
+    旧表 chat_memories 已由 _migrate_chat_memories 回填进新表；
+    这里只读新表，字段形状保持 [{id, content, round, createdAt}]。
+    """
+    where = ["i.user_id IS ?", "i.status='active'"]
+    args: list = [user_id]
+    if character_id:
+        where.append("i.character_id=?")
+        args.append(str(character_id))
+    if session_id is not None:
+        where.append("i.session_id=?")
+        args.append(str(session_id))
+    # 回填行按 source_turn 回查旧表的轮次，保证 round 显示真实轮数
+    sql = ("SELECT i.id, i.content, i.kind, i.created_at,"
+           " COALESCE(m.round_no, 0) AS round_no"
+           " FROM chat_memory_items i"
+           " LEFT JOIN chat_memories m"
+           " ON i.source_turn = 'legacy:chat_memories:' || m.id"
+           " WHERE " + " AND ".join(where) + " ORDER BY i.id ASC")
+    if limit and int(limit) > 0:
+        sql += " LIMIT ?"
+        args.append(int(limit))
+    return [{"id": int(r["id"]), "content": str(r["content"] or ""),
+             "round": int(r["round_no"] or 0), "kind": str(r["kind"] or ""),
+             "createdAt": str(r["created_at"] or "")}
+            for r in query(sql, tuple(args))]
+
+
+def delete_chat_memory_item(user_id: int | None, memory_id: int) -> int:
+    """删除新表里的一条记忆（向量 / FTS 一并清理）。"""
+    mid = int(memory_id or 0)
+    if not mid or not one("SELECT id FROM chat_memory_items"
+                          " WHERE user_id IS ? AND id=?", (user_id, mid)):
+        return 0
+    _purge_memory_items("user_id IS ? AND id=?", (user_id, mid))
+    return 1
 
 
 def chat_memories(user_id: int | None, character_id: str,
@@ -6751,6 +6990,9 @@ def db_recreate(user_id: int | None = None) -> dict:
 
 
 def db_drop_all(user_id: int | None = None) -> dict:
+    # 旧接入表名现在是视图，先移除，避免留下指向已删物理表的悬空视图
+    for view in _PROVIDER_TABLES.values():
+        execute(f"DROP VIEW IF EXISTS {view}")
     names = [t["name"] for t in db_tables() if t["name"] not in SYSTEM_TABLES]
     _drop_tables(names)
     db_log("DROP_ALL", "", json.dumps({"dropped": names}, ensure_ascii=False), user_id)
@@ -7044,6 +7286,90 @@ def set_memory_vector(memory_id: int, embedding, model: str = "hash") -> None:
         (int(memory_id), str(model or "hash"), len(blob) // 4, blob))
 
 
+# ------------------------------------------------------------ 本地 LSA 模型
+def local_embedding_model(name: str = "local-lsa") -> dict | None:
+    """取某个本地模型当前启用的版本（没有训练过返回 None）。"""
+    return one("SELECT * FROM local_embed_models WHERE name=? AND active=1"
+               " ORDER BY version DESC LIMIT 1", (str(name),))
+
+
+def local_embedding_models(limit: int = 20) -> list[dict]:
+    return query("SELECT * FROM local_embed_models ORDER BY id DESC LIMIT ?",
+                 (int(limit or 20),))
+
+
+def create_local_embedding_model(name: str, dim: int, corpus_count: int,
+                                 term_count: int, source: str, params: dict,
+                                 elapsed_ms: int = 0) -> int:
+    """新建一个模型版本并把同名旧版本置为非启用。"""
+    conn = get_conn()
+    last = conn.execute(
+        "SELECT version FROM local_embed_models WHERE name=?"
+        " ORDER BY version DESC LIMIT 1", (str(name),)).fetchone()
+    version = int(last["version"] if last else 0) + 1
+    conn.execute("UPDATE local_embed_models SET active=0 WHERE name=?", (str(name),))
+    ts = now_iso()
+    cur = conn.execute(
+        "INSERT INTO local_embed_models(name, version, kind, dim, corpus_count,"
+        " term_count, source, params_json, active, trained_at, elapsed_ms,"
+        " created_at) VALUES(?,?, 'local',?,?,?,?,?, 1,?,?,?)",
+        (str(name), version, int(dim), int(corpus_count), int(term_count),
+         str(source), json.dumps(params or {}, ensure_ascii=False),
+         ts, int(elapsed_ms), ts))
+    model_id = int(cur.lastrowid or 0)
+    conn.execute(
+        "INSERT OR REPLACE INTO local_embed_state(model_id, last_train_at,"
+        " projected_count, corpus_at_train, updated_at) VALUES(?,?,0,?,?)",
+        (model_id, ts, int(corpus_count), ts))
+    conn.commit()
+    return model_id
+
+
+def save_local_embedding_terms(model_id: int, rows: list[tuple]) -> int:
+    """批量写词项统计；rows = [(term, df, idf, vec_blob), ...]。"""
+    if not model_id or not rows:
+        return 0
+    conn = get_conn()
+    conn.executemany(
+        "INSERT OR REPLACE INTO local_embed_terms(model_id, term, df, idf, vec)"
+        " VALUES(?,?,?,?,?)",
+        [(int(model_id), str(t), int(df), float(idf), blob)
+         for t, df, idf, blob in rows])
+    conn.commit()
+    return len(rows)
+
+
+def local_embedding_terms(model_id: int) -> list[dict]:
+    return query("SELECT term, df, idf, vec FROM local_embed_terms"
+                 " WHERE model_id=? ORDER BY df DESC", (int(model_id),))
+
+
+def local_embedding_state(model_id: int) -> dict | None:
+    return one("SELECT * FROM local_embed_state WHERE model_id=?", (int(model_id),))
+
+
+def update_local_embedding_state(model_id: int, *, projected_count=None,
+                                 corpus_at_train=None) -> None:
+    fields, args = ["updated_at=?"], [now_iso()]
+    if projected_count is not None:
+        fields.append("projected_count=?")
+        args.append(int(projected_count))
+        fields.append("last_project_at=?")
+        args.append(now_iso())
+    if corpus_at_train is not None:
+        fields.append("corpus_at_train=?")
+        args.append(int(corpus_at_train))
+    execute("UPDATE local_embed_state SET " + ", ".join(fields)
+            + " WHERE model_id=?", tuple(args) + (int(model_id),))
+
+
+def local_vector_coverage(model: str) -> int:
+    """某模型已经拥有向量的记忆条数。"""
+    row = one("SELECT COUNT(*) AS c FROM chat_memory_vectors WHERE model=?",
+              (str(model),))
+    return int((row or {}).get("c") or 0)
+
+
 def add_memory_item(user_id: int | None, character_id: str, session_id: str,
                     kind: str, content: str, *, importance: float = 0.5,
                     confidence: float = 0.7, subject: str = "",
@@ -7194,7 +7520,7 @@ def items_missing_vector(user_id: int | None, character_id: str, session_id: str
         where.append("i.session_id=?")
         args.append(str(session_id))
     rows = query(
-        "SELECT i.id, i.content, i.hash FROM chat_memory_items i"
+        "SELECT i.id, i.content, i.subject, i.object, i.hash FROM chat_memory_items i"
         " LEFT JOIN chat_memory_vectors v ON v.memory_id=i.id AND v.model=?"
         " WHERE v.memory_id IS NULL AND " + " AND ".join(where) +
         " ORDER BY i.id DESC LIMIT ?",

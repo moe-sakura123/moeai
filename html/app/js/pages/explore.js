@@ -50,7 +50,7 @@
       return;
     }
     box.innerHTML = state.items.map((it, i) => {
-      const cid = T.str(T.pick(it, ['characterID', 'characterId', 'id']));
+      const cid = T.str(T.pick(it, ['characterId', 'id']));
       const name = T.str(T.pick(it, ['name', 'title']), '未命名');
       const summary = plain(T.pick(it, ['summary', 'description'])) || '这个角色还没有写简介。';
       const cover = T.str(T.pick(it, ['cover', 'coverURL', 'avatarURL'])) ||

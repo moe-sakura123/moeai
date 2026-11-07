@@ -21,7 +21,7 @@
     cgRule: '',
     dirty: false,
     worldbook: [],
-    // 导入角色卡时先把 world_book 存在这里，保存拿到 characterID 后再写进库
+    // 导入角色卡时先把 world_book 存在这里，保存拿到 characterId 后再写进库
     pendingWorldBook: null,
     // 分类/性向/标签选择器的当前值（对应 JSON: genderOrientation / extensions / tags）
     category: { orientation: '', type: '', tags: [], personality: '', source: '' },
@@ -47,7 +47,7 @@
 
   function blankWork() {
     return {
-      characterID: '', name: '', avatarURL: '', coverURL: '', summary: '',
+      characterId: '', name: '', avatarURL: '', coverURL: '', summary: '',
       tags: [], genderOrientation: '', extensions: { orientation: '', type: '', source: '', personality: '' },
       personality: '', description: '', scenario: '',
       promptData: blankPrompt(), customCSS: '', blockedWords: [],
@@ -75,7 +75,7 @@
   }
 
   function cidOf(w) {
-    return T.str(T.pick(w, ['characterID', 'characterId', 'ID', 'id', 'workID']));
+    return T.str(T.pick(w, ['characterId', 'ID', 'id', 'workID']));
   }
   function sameCid(w) {
     return !!state.cid && cidOf(w) === state.cid;
@@ -149,7 +149,7 @@
       el.classList.toggle('active', el.getAttribute('data-cid') === cid);
     });
     state.pendingWorldBook = null;
-    A.get('/api/gva/work/my', { characterID: cid })
+    A.get('/api/gva/work/my', { characterId: cid })
       .then((data) => {
         const w = T.isObj(data) ? data : null;
         if (!w) { U.toast('作品读取为空，可能已被删除', false); state.work = blankWork(); renderForm(); return; }
@@ -900,8 +900,8 @@
     w.firstMes = greet.first;
     w.alternateGreetings = greet.alts;
     w.quickCommands = { commands: collectQuickCommands() };
-    if (state.cid) w.characterID = state.cid;
-    else delete w.characterID;
+    if (state.cid) w.characterId = state.cid;
+    else delete w.characterId;
     return w;
   }
 
@@ -939,7 +939,7 @@
       return;
     }
     box.innerHTML = '<div class="loading-line">加载中…</div>';
-    A.get(EP + 'getEntriesByCharacterID', { characterID: state.cid })
+    A.get(EP + 'getEntriesByCharacterID', { characterId: state.cid })
       .then((data) => {
         state.worldbook = Array.isArray(data) ? data : T.asList(data, ['list', 'records']);
         box.innerHTML = state.worldbook.length
@@ -976,7 +976,7 @@
     const e = T.isObj(entry) ? entry : {};
     const keys = wbKeysOf(e);
     const canonical = {
-      characterID: cid,
+      characterId: cid,
       comment: T.str(e.comment) || keys[0] || '导入条目',
       keys: keys,
       content: T.str(e.value !== undefined ? e.value : T.pick(e, ['content', 'value'])),
@@ -1028,7 +1028,7 @@
         format: 'missai',
         version: '1.0',
         exportTime: new Date().toISOString(),
-        characterID: state.cid || '',
+        characterId: state.cid || '',
         name: w.name,
         summary: w.summary,
         description: w.description,
@@ -1062,7 +1062,7 @@
     };
 
     if (!state.cid) { build(Array.isArray(state.pendingWorldBook) ? state.pendingWorldBook : []); return; }
-    A.get(EP + 'getEntriesByCharacterID', { characterID: state.cid })
+    A.get(EP + 'getEntriesByCharacterID', { characterId: state.cid })
       .then((data) => {
         const entries = Array.isArray(data) ? data : T.asList(data, ['list', 'records']);
         build(entries.length ? entries : state.worldbook);
@@ -1107,8 +1107,8 @@
         postPrompt: T.str(pd.postPrompt) || T.str(obj.postHistoryInstructions),
       },
       publishStatus: 'draft',
-      // 导入一律当新作品：清掉原 characterID，保存时由服务端生成新的
-      characterID: '',
+      // 导入一律当新作品：清掉原 characterId，保存时由服务端生成新的
+      characterId: '',
     });
     work.systemPrompt = work.promptData.systemPrompt;
     work.postHistoryInstructions = work.promptData.postPrompt;
@@ -1538,7 +1538,7 @@
       state.work = Object.assign(blankWork(), saved, w);
       state.cid = cidOf(saved) || state.cid;
       state.saved = true;
-      state.work.characterID = state.cid;
+      state.work.characterId = state.cid;
       S.setLastWork(state.cid);
       renderPublish(T.str(saved.publishStatus, 'draft'));
       updateSide();
@@ -1559,7 +1559,7 @@
 
   function publish() {
     if (!state.cid) { U.toast('请先保存作品', false); return; }
-    A.post('/api/gva/work/publish', { characterID: state.cid })
+    A.post('/api/gva/work/publish', { characterId: state.cid })
       .then((data) => {
         const st = T.str(T.pick(data, ['publishStatus', 'status']), 'published');
         state.work.publishStatus = st;
@@ -1574,7 +1574,7 @@
 
   function unpublish() {
     if (!state.cid) return;
-    A.post('/api/gva/work/unpublish', { characterID: state.cid })
+    A.post('/api/gva/work/unpublish', { characterId: state.cid })
       .then(() => {
         state.work.publishStatus = 'draft';
         renderPublish('draft');
@@ -1587,7 +1587,7 @@
   function removeWork() {
     if (!state.cid) { U.toast('当前还没有保存过的作品', false); return; }
     U.confirmDialog('删除作品', '删除后角色和它的世界书都会一并删掉，且不可恢复。', () => {
-      A.del('/api/gva/work', { characterID: state.cid })
+      A.del('/api/gva/work', { characterId: state.cid })
         .then(() => {
           U.toast('已删除');
           state.cid = '';

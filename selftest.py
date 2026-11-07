@@ -970,18 +970,22 @@ def main():
     st, h, b = call("GET", f"/api/gva/narratium/summaryConfig/getByCharacter"
                            f"?characterID={cid}", headers=admin_ck)
     d = json.loads(b or b"{}").get("data") or {}
-    check("记忆配置字段齐全", isinstance(d.get("summaryReserveRounds"), int)
-          and isinstance(d.get("summaryEnabled"), bool), f"{b[:240]}")
+    check("记忆总闸字段齐全", isinstance(d.get("summaryEnabled"), bool),
+          f"{b[:240]}")
     st, h, b = call("POST", "/api/gva/narratium/summaryConfig/saveByCharacter",
-                    {"characterID": cid, "summaryEnabled": False,
-                     "summaryInjectMode": "inline", "summaryReserveRounds": 5},
+                    {"characterID": cid, "summaryEnabled": False},
                     headers=admin_ck)
     check("保存记忆配置 code=0", json.loads(b or b"{}").get("code") == 0, f"{b[:200]}")
     st, h, b = call("GET", f"/api/gva/narratium/summaryConfig/getByCharacter"
                            f"?characterID={cid}", headers=admin_ck)
     d = json.loads(b or b"{}").get("data") or {}
-    check("记忆配置刷新后还在", d.get("summaryReserveRounds") == 5
-          and d.get("summaryEnabled") is False, f"{b[:240]}")
+    check("记忆总闸刷新后还在", d.get("summaryEnabled") is False, f"{b[:240]}")
+    st, h, b = call("GET", f"/api/gva/narratium/promptConfig/getByCharacter"
+                           f"?characterID={cid}", headers=admin_ck)
+    d = json.loads(b or b"{}").get("data") or {}
+    check("压缩保留轮数有默认值",
+          int((d.get("memory") or {}).get("compressKeepRounds") or 0) >= 1,
+          f"{b[:240]}")
 
     # 收尾：清掉自测写入的两组配置，回到默认值
     admin_uid = (db.get_session(admin_token) or {}).get("id")

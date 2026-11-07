@@ -1,9 +1,16 @@
-# ---- Python ----
+# ---- Python 缓存 ----
 __pycache__/
 *.py[cod]
+*$py.class
 *.egg-info/
+.pytest_cache/
+
+# ---- 虚拟环境 ----
 .venv/
 venv/
+
+# ---- 本地大模型权重（bge-m3 / bge-reranker-v2-m3，约 2 GB+，绝不入库）----
+models/
 
 # ---- 运行时数据（含密钥/会话，不入库）----
 # missai.db / image.db 存了账号会话、访问日志、模型接入的 api_key、绘图密钥
@@ -17,12 +24,26 @@ data/.current_db
 logs/
 *.log
 
+# ---- 截图与临时产物 ----
+.screenshots/
+tmp/
+*.tmp
+
 # ---- 抓取/上传的本地图片资产（体积大、可再生）----
 html/image/
 html/assets/uploads/
 
-# ---- 系统 / 编辑器 ----
+# ---- 本地配置与密钥 ----
+.env
+.env.*
+*.local.json
+
+# ---- 编辑器 / 系统 ----
+# .vscode 只忽略个人配置（settings.json / launch.json 等本机路径与偏好），
+# 推荐扩展列表与共享任务仍可入库
+.vscode/*
+!.vscode/extensions.json
+!.vscode/tasks.json
+.idea/
 Thumbs.db
 .DS_Store
-.idea/
-.vscode/

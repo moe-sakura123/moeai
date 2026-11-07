@@ -226,8 +226,8 @@
     });
   }
 
-  /* 「记忆」面板：记忆区——摘要由后端在对话中自动生成（每聊满几轮自动提炼，
-     存 chat_memories），这里只做查看 / 删除，不用手写 */
+  /* 「记忆」面板：记忆区——摘要 / 结构化条目由后端在对话中自动生成，
+     存 chat_memory_items，这里只做查看 / 删除，不用手写 */
   function openMemoryPanel() {
     if (!state.charId) { U.toast('请先打开一个角色', false); return; }
     const charName = T.str(T.pick(state.char, ['name', 'title']), '当前角色');
@@ -235,7 +235,7 @@
     function emptyHtml() {
       return '<div class="mem-empty">' +
         '<div class="mem-brain">🧠</div>' +
-        '<p class="mem-empty-title">暂无记忆摘要</p>' +
+        '<p class="mem-empty-title">暂无记忆</p>' +
         '<p class="tiny muted">AI 会在对话过程中自动生成记忆摘要</p>' +
         '</div>';
     }
@@ -243,9 +243,10 @@
     function itemHtml(it, i) {
       const lines = String(it.content || '').split('\n').filter((l) => l.trim());
       const when = String(it.createdAt || '').slice(0, 16).replace('T', ' ');
+      const round = Number(it.round) || 0;
       return '<div class="mem-item" data-i="' + i + '">' +
         '<div class="mem-head">' +
-        '<span class="mem-round">第 ' + (Number(it.round) || 0) + ' 轮</span>' +
+        (round > 0 ? '<span class="mem-round">第 ' + round + ' 轮</span>' : '') +
         '<span class="tiny muted">' + esc(when) + '</span>' +
         '<span class="grow"></span>' +
         '<button type="button" class="cc-del" data-del="' + i + '">删除</button>' +
@@ -291,8 +292,10 @@
   /* ---------------------------------------------------------- 对话设置面板 */
   /* 齿轮按钮弹出的「对话设置」（与源站一致分三组）：
      显示设置 → 字体大小/行间距/思维链/CG调试/阅读安全模式/禁用作者样式（存 localStorage）
-     记忆设置 → 基础记忆轮数/增强记忆（存服务端 summaryConfig）
-     模型参数 → 温度/TopP/存在惩罚/频率惩罚/最大回复长度（存服务端 modelConfig） */
+     记忆设置 → 压缩保留轮数/增强记忆 + 高级选项（summaryEnabled 存 summaryConfig，
+               其余存 promptEngine.memory）
+     模型参数 → 温度/TopP/存在惩罚/频率惩罚/最大回复长度/上下文窗口
+               （存服务端 modelConfig；面板只展示上一轮真实下发值，不参与计算） */
   const DISPLAY_KEY = 'chat.display';
   const DISPLAY_DEFAULT = {
     fontSize: 1, lineHeight: 1.6, showThinking: false, cgDebug: true,
@@ -304,13 +307,25 @@
   const DISPLAY_RANGE = { fontSize: [0.8, 1.5], lineHeight: [1.2, 2.5] };
   const MODEL_DEFAULT = {
     temperature: 0.7, topP: 0.8, presencePenalty: 0,
-    frequencyPenalty: 0, maxTokens: 8192,
+    frequencyPenalty: 0, maxTokens: 8192, contextWindow: 8192,
   };
+  // 与后端 server.py 的 MODEL_PARAM_RANGES 完全一致，越界一律钳制
   const MODEL_RANGE = {
     temperature: [0, 1], topP: [0, 1], presencePenalty: [0, 1],
     frequencyPenalty: [0, 1], maxTokens: [256, 8192],
+    contextWindow: [1024, 32768],
   };
-  const MEMORY_DEFAULT = { summaryEnabled: true, summaryReserveRounds: 3 };
+  const MODEL_INT_KEYS = ['maxTokens', 'contextWindow'];
+  const MEMORY_DEFAULT = {
+    summaryEnabled: true, compressKeepRounds: 6,
+    topK: 8, injectDepth: 4, maxTokens: 600, waitMs: 8000,
+  };
+  const MEMORY_RANGE = {
+    compressKeepRounds: [1, 24], topK: [1, 20], injectDepth: [0, 10],
+    maxTokens: [200, 2000], waitMs: [1000, 15000],
+  };
+  const MEMORY_KEYS = ['summaryEnabled', 'compressKeepRounds', 'topK',
+    'injectDepth', 'maxTokens', 'waitMs'];
 
   function clampNum(v, min, max, dft) {
     const n = Number(v);
@@ -398,10 +413,27 @@
       switchRow('promptLog', 'Prompt 快照', '开启后把每次发给 AI 的完整 prompt 落盘到数据库，便于调试/复现', d.promptLog) +
       '</div>' +
       '<div class="cs-group"><div class="cs-gtitle">记忆设置</div>' +
-      sliderRow('summaryReserveRounds', '基础记忆轮数', 'AI 记忆的最近对话轮数',
-        1, 5, 1, mem.summaryReserveRounds, 'int') +
-      switchRow('summaryEnabled', '增强记忆', '启用后 AI 将更好地记住之前的对话内容',
+      sliderRow('compressKeepRounds', '基础记忆轮数',
+        '保留最近 N 轮对话原文，更早的会被压缩成摘要',
+        MEMORY_RANGE.compressKeepRounds[0], MEMORY_RANGE.compressKeepRounds[1],
+        1, mem.compressKeepRounds, 'int') +
+      switchRow('summaryEnabled', '增强记忆',
+        '关闭后不检索、不注入记忆、不生成摘要与结构化记忆',
         mem.summaryEnabled) +
+      '<details class="cs-adv"><summary>高级选项</summary>' +
+      sliderRow('topK', '检索条数', '每轮最多注入多少条相关记忆',
+        MEMORY_RANGE.topK[0], MEMORY_RANGE.topK[1], 1, mem.topK, 'int') +
+      sliderRow('injectDepth', '注入深度', '0 表示紧贴本轮，数字越大越靠前',
+        MEMORY_RANGE.injectDepth[0], MEMORY_RANGE.injectDepth[1], 1,
+        mem.injectDepth, 'int') +
+      sliderRow('maxTokens', '记忆预算', '注入记忆块的 token 上限',
+        MEMORY_RANGE.maxTokens[0], MEMORY_RANGE.maxTokens[1], 50,
+        mem.maxTokens, 'int') +
+      sliderRow('waitMs', '召回等待（ms）', '这是上限，检索完成即返回',
+        MEMORY_RANGE.waitMs[0], MEMORY_RANGE.waitMs[1], 500,
+        mem.waitMs, 'int') +
+      '</details>' +
+      '<p class="tiny muted cs-note" id="cs-mem-status" hidden></p>' +
       '<p class="tiny muted cs-note">记忆摘要由 AI 在对话中自动生成。</p>' +
       '</div>' +
       '<div class="cs-group"><div class="cs-gtitle">模型参数</div>' +
@@ -416,6 +448,10 @@
         MODEL_RANGE.frequencyPenalty[0], MODEL_RANGE.frequencyPenalty[1], 0.05, mdl.frequencyPenalty) +
       sliderRow('maxTokens', '最大回复长度', '单次回复的最大 token 数量',
         MODEL_RANGE.maxTokens[0], MODEL_RANGE.maxTokens[1], 64, mdl.maxTokens, 'int') +
+      sliderRow('contextWindow', '上下文窗口', '模型可接收的总 token 数（输入 + 输出）',
+        MODEL_RANGE.contextWindow[0], MODEL_RANGE.contextWindow[1], 1024,
+        mdl.contextWindow, 'int') +
+      '<p class="tiny muted cs-note" id="cs-mdl-actual">实际下发值 = 设定值，除非输入把窗口占满；发送一轮后这里显示上一轮的「设定值 / 实际下发值」。</p>' +
       '</div>';
 
     const mask = U.openModal({
@@ -428,24 +464,61 @@
         /* 打开后拉服务端配置（记忆 + 模型参数），拉到就把滑条拨到真实值。
            用户已点过「恢复默认」就不再回填，避免异步返回把默认值覆盖掉 */
         let resetDone = false;
+        let memDirty = false;          // 用户已动过记忆控件 → 忽略晚到的回填
         A.get('/api/gva/narratium/summaryConfig/getByCharacter',
-          { characterID: state.charId }).then((data) => {
-            if (resetDone || !data || typeof data !== 'object') return;
+          { characterId: state.charId }).then((data) => {
+            if (resetDone || memDirty || !data || typeof data !== 'object') return;
             if (typeof data.summaryEnabled === 'boolean') mem.summaryEnabled = data.summaryEnabled;
-            const r = Number(data.summaryReserveRounds);
-            if (isFinite(r)) mem.summaryReserveRounds = clampNum(r, 1, 5, 3);
-            setRange('summaryReserveRounds', mem.summaryReserveRounds, 'int');
             setCheck('summaryEnabled', mem.summaryEnabled);
+          }).catch(() => {});
+        A.get('/api/gva/narratium/promptConfig/getByCharacter',
+          { characterID: state.charId }).then((data) => {
+            if (resetDone || memDirty || !data || typeof data !== 'object') return;
+            const mc = (data.memory && typeof data.memory === 'object') ? data.memory : {};
+            const rc = (mc.recall && typeof mc.recall === 'object') ? mc.recall : {};
+            setMem('compressKeepRounds', mc.compressKeepRounds);
+            setMem('injectDepth', mc.injectDepth);
+            setMem('maxTokens', mc.maxTokens);
+            setMem('topK', rc.topK);
+            setMem('waitMs', rc.waitMs);
+          }).catch(() => {});
+        // 只读状态：最近一次召回条数 / 等待耗时（拿不到就保持隐藏，不编数据）
+        const statusEl = m.querySelector('#cs-mem-status');
+        A.get('/api/chat/memory-status',
+          { characterId: state.charId, sessionId: state.sessionId }).then((data) => {
+            if (!statusEl || !data || !data.available) return;
+            const n = Math.max(0, Number(data.count) || 0);
+            const ms = Math.max(0, Number(data.waitMs) || 0);
+            statusEl.textContent = '最近一次召回：' + n + ' 条记忆 · 等待 ' +
+              Math.round(ms) + ' ms';
+            statusEl.hidden = false;
           }).catch(() => {});
         A.get('/api/gva/narratium/modelConfig/getByModelRate',
           { modelRateId: mid }).then((data) => {
             if (resetDone || !data || typeof data !== 'object') return;
+            // 与后端同一套范围钳制，脏值不会把滑条位置和数字显示搞乱
             Object.keys(MODEL_DEFAULT).forEach((k) => {
-              const v = Number(data[k]);
-              if (isFinite(v)) mdl[k] = v;
+              mdl[k] = clampNum(data[k], MODEL_RANGE[k][0], MODEL_RANGE[k][1],
+                MODEL_DEFAULT[k]);
+              setRange(k, mdl[k], MODEL_INT_KEYS.indexOf(k) !== -1 ? 'int' : '');
             });
-            Object.keys(MODEL_DEFAULT).forEach((k) =>
-              setRange(k, mdl[k], k === 'maxTokens' ? 'int' : ''));
+          }).catch(() => {});
+        // 只读状态：上一轮真实下发的参数（拿不到就保留"会随上下文浮动"的说明）
+        const actualEl = m.querySelector('#cs-mdl-actual');
+        A.get('/api/chat/model-params-status',
+          { modelRateId: mid, sessionId: state.sessionId }).then((data) => {
+            if (!actualEl || !data || !data.available) return;
+            const sent = Number(data.maxTokens) || 0;
+            const savedV = Number(data.maxTokensSaved) || 0;
+            const est = Number(data.inputTokens) || 0;
+            actualEl.textContent = '上一轮实际下发：temperature ' +
+              Number(data.temperature || 0).toFixed(2) + ' · top_p ' +
+              Number(data.topP || 0).toFixed(2) + ' · max_tokens 设定 ' +
+              savedV + ' / 实际 ' + sent +
+              (sent < savedV
+                ? '（输入约 ' + est + ' token，窗口 ' + (Number(data.contextWindow) || 0) +
+                  '，已按窗口压低）'
+                : '（与设定一致）');
           }).catch(() => {});
         // AICG 插图开关：用户级偏好存后端 cg:preference.showCGInChat，
         // 打开面板以后端为准拨开关（跨设备/跨浏览器一致）
@@ -468,6 +541,13 @@
         function setCheck(key, on) {
           const c = m.querySelector('input[data-cs="' + key + '"]');
           if (c) c.checked = !!on;
+        }
+        /* 记忆数值：按统一范围钳制后写回滑条，保证显示值与后端一致 */
+        function setMem(key, val) {
+          const range = MEMORY_RANGE[key];
+          if (!range) return;
+          mem[key] = clampNum(val, range[0], range[1], MEMORY_DEFAULT[key]);
+          setRange(key, mem[key], 'int');
         }
 
         /* 滑条 / 开关的值统一收集 */
@@ -497,19 +577,35 @@
           applyDisplay();
         }
 
-        /* 服务端两项：改动后防抖保存（silent=true 时不弹保存提示） */
+        /* 记忆设置：两处服务端配置，改动后统一防抖保存
+           · summaryEnabled → summaryConfig（记忆总闸）
+           · 其余数值 → promptEngine.memory（深合并，不冲掉别的记忆参数） */
         let memTimer = 0;
         function saveMem(silent) {
           clearTimeout(memTimer);
           memTimer = setTimeout(() => {
-            mem.summaryReserveRounds = collect().num('summaryReserveRounds');
-            mem.summaryEnabled = collect().chk('summaryEnabled');
-            A.post('/api/gva/narratium/summaryConfig/saveByCharacter', {
-              characterID: state.charId,
+            MEMORY_KEYS.forEach((k) => {
+              const el = m.querySelector('[data-cs="' + k + '"]');
+              if (!el) return;
+              if (el.type === 'checkbox') { mem[k] = !!el.checked; return; }
+              const range = MEMORY_RANGE[k];
+              mem[k] = clampNum(el.value, range[0], range[1], MEMORY_DEFAULT[k]);
+            });
+            const p1 = A.post('/api/gva/narratium/summaryConfig/saveByCharacter', {
+              characterId: state.charId,
               summaryEnabled: mem.summaryEnabled,
-              summaryInjectMode: 'inline',
-              summaryReserveRounds: mem.summaryReserveRounds,
-            }).then(() => { if (!silent) U.toast('记忆设置已保存'); })
+            });
+            const p2 = A.post('/api/gva/narratium/promptConfig/saveByCharacter', {
+              characterID: state.charId,
+              memory: {
+                compressKeepRounds: mem.compressKeepRounds,
+                injectDepth: mem.injectDepth,
+                maxTokens: mem.maxTokens,
+                recall: { topK: mem.topK, waitMs: mem.waitMs },
+              },
+            });
+            Promise.all([p1, p2])
+              .then(() => { if (!silent) U.toast('记忆设置已保存'); })
               .catch((e) => U.toast(e.message || '记忆设置保存失败', false));
           }, 500);
         }
@@ -551,12 +647,14 @@
           // 数值旁的即时显示
           const s = m.querySelector('[data-csv="' + key + '"]');
           if (s && t.type === 'range') {
-            s.textContent = (key === 'maxTokens' || key === 'summaryReserveRounds')
+            s.textContent = (MODEL_INT_KEYS.indexOf(key) !== -1 ||
+              MEMORY_KEYS.indexOf(key) !== -1)
               ? Math.round(t.value) : Number(t.value).toFixed(2);
           }
           if (DISPLAY_DEFAULT.hasOwnProperty(key)) {
             applyDisplayFields();
-          } else if (key === 'summaryEnabled' || key === 'summaryReserveRounds') {
+          } else if (MEMORY_KEYS.indexOf(key) !== -1) {
+            memDirty = true;
             saveMem();
           } else if (MODEL_DEFAULT.hasOwnProperty(key)) {
             saveModel();
@@ -570,7 +668,7 @@
             applyDisplayFields();
             if (key === 'aigcIllust') saveCgPref();   // 用户级偏好，同步后端
           }
-          else if (key === 'summaryEnabled') saveMem();
+          else if (MEMORY_KEYS.indexOf(key) !== -1) { memDirty = true; saveMem(); }
         });
 
         // 恢复默认：三组全部回默认值（显示设置即刻生效，记忆/模型参数回写服务端）
@@ -588,11 +686,13 @@
           applyDisplayFields();
           // 记忆设置 + 模型参数：拨回默认并保存
           Object.keys(MODEL_DEFAULT).forEach((k) => setRange(k, MODEL_DEFAULT[k],
-            k === 'maxTokens' ? 'int' : ''));
-          setRange('summaryReserveRounds', MEMORY_DEFAULT.summaryReserveRounds, 'int');
+            MODEL_INT_KEYS.indexOf(k) !== -1 ? 'int' : ''));
+          Object.keys(MEMORY_RANGE).forEach((k) => {
+            mem[k] = MEMORY_DEFAULT[k];
+            setRange(k, mem[k], 'int');
+          });
           setCheck('summaryEnabled', MEMORY_DEFAULT.summaryEnabled);
           mem.summaryEnabled = MEMORY_DEFAULT.summaryEnabled;
-          mem.summaryReserveRounds = MEMORY_DEFAULT.summaryReserveRounds;
           Object.keys(MODEL_DEFAULT).forEach((k) => { mdl[k] = MODEL_DEFAULT[k]; });
           saveMem(true);
           saveModel(true);
@@ -669,7 +769,7 @@
   function loadCharacter() {
     if (!state.charId) return Promise.resolve(false);
     return A.get('/api/gva/narratiumCharacter/findNarratiumCharacterByCharacterID',
-      { characterID: state.charId }, { timeout: 10000 })
+      { characterId: state.charId }, { timeout: 10000 })
       .then((data) => {
         const ch = T.isObj(data) && T.isObj(data.character) ? data.character : data;
         if (!T.isObj(ch) || !T.str(T.pick(ch, ['characterName', 'name']))) return false;
@@ -1595,7 +1695,7 @@
       .then((data) => {
         const list = T.asList(data, ['list', 'records']);
         if (list.length) {
-          const cid = T.str(T.pick(list[0], ['characterID', 'characterId', 'ID', 'id']));
+          const cid = T.str(T.pick(list[0], ['characterId', 'ID', 'id']));
           if (cid) { start(cid); return; }
         }
         $('c-name').textContent = '还没有角色';

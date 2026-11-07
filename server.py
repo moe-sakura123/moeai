@@ -17,6 +17,7 @@ server.py — 本地运行镜像站点（纯 Python 标准库，无第三方依�
 import hashlib
 import http.client
 import json
+import math
 import os
 import queue
 import re
@@ -42,7 +43,7 @@ from prompt_builder import (count_tokens, estimate_messages, prompt_prefix_hash,
                             sectionize, set_token_alpha)
 from roleplay_core.prompt import (build_prompt, compress_for_budget,
                                      prompt_diff, shrink_for_overflow)
-from roleplay_core import memory_engine
+from roleplay_core import memory_engine, memory_recall
 from roleplay_core.post_processor import parse_status, process_output, status_dict
 from roleplay_core import ChatContext, Message
 from roleplay_core.emotion_mapper import EmotionMapper
@@ -233,12 +234,39 @@ _ACTIVE_STREAMS_LOCK = threading.Lock()
 _SUMMARY_LOCK = threading.Lock()
 _MEMORY_LOCK = threading.Lock()
 
+# 最近一次召回状态（只读展示用）：key = (uid, sessionId, characterId)
+_RECALL_STATS: dict[tuple[int, str, str], dict] = {}
+
+# 最近一轮真实下发的模型参数（只读展示用）：key = (uid, sessionId, modelRateId)
+_LAST_MODEL_PARAMS: dict[tuple[int, str, str], dict] = {}
+_LAST_MODEL_PARAMS_LOCK = threading.Lock()
+
 # ------------------------------------------------------------- 历史压缩
 # 发送前确定性裁剪保底最近 COMPRESS_KEEP_ROUNDS 轮原文；
 # 被裁掉的历史进后台压缩队列，由默认模型并进滚动摘要 / 记忆槽（下一轮生效）。
 COMPRESS_KEEP_ROUNDS = 6           # 可被 db 配置 llm_compress_keep_rounds 覆盖
 COMPRESS_KEEP_MAX_ROUNDS = 24      # 与 SUMMARY_WINDOW=24 条摘要窗口对齐的上限
 SUMMARY_BATCH = 6                  # 每次摘要最多吃 6 条淘汰消息
+
+# ------------------------------------------------------- 对话设置的模型参数
+# 前端 chat.js 的 MODEL_RANGE 与这里必须完全一致；保存时越界钳制、非数字拒绝。
+MODEL_PARAM_RANGES = {
+    "temperature": (0.0, 1.0, float),
+    "topP": (0.0, 1.0, float),
+    "presencePenalty": (0.0, 1.0, float),
+    "frequencyPenalty": (0.0, 1.0, float),
+    "maxTokens": (256, 8192, int),
+    "contextWindow": (1024, 32768, int),
+}
+MODEL_PARAM_DEFAULTS = {
+    "temperature": 0.7, "topP": 0.8,
+    "presencePenalty": 0.0, "frequencyPenalty": 0.0, "maxTokens": 8192,
+}
+MODEL_OUTPUT_MIN, MODEL_OUTPUT_MAX = 256, 8192
+# 输出预算最多占窗口 3/4：输入至少留 1/4（且不低于 512 token）。
+# 「最大回复长度」调大到窗口上限时，也只会拿到这个上限，不会挤掉输入空间。
+MODEL_INPUT_RESERVE_RATIO = 0.25
+MODEL_INPUT_RESERVE_MIN = 512
 
 _COMPRESS_Q: "queue.Queue[tuple[int, str, str]]" = queue.Queue()
 _COMPRESS_SEEN: set[tuple[int, str, str]] = set()
@@ -251,8 +279,9 @@ def _compress_worker() -> None:
     while True:
         uid, sid, cid = _COMPRESS_Q.get()
         try:
-            Handler._maybe_summarize(uid, sid, cid,
-                                     keep=max(2, COMPRESS_KEEP_ROUNDS * 2))
+            Handler._maybe_summarize(
+                uid, sid, cid,
+                keep=max(2, Handler._compress_keep_rounds(uid, cid) * 2))
         except Exception as exc:                     # noqa: BLE001
             print(f"[compress] 后台压缩失败：{exc}", file=sys.stderr)
         finally:
@@ -1124,7 +1153,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:  # noqa: BLE001
                 tags = []
             items.append({
-                "characterID": r.get("character_id") or "",
+                "characterId": r.get("character_id") or "",
                 "name": r.get("name") or "",
                 "summary": r.get("summary") or "",
                 "author": r.get("author_name") or "",
@@ -2061,7 +2090,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._int(params.get("pageSize") or 20, 20)))
 
             if path == "/local/api/creation/work" and self.command in ("GET", "HEAD"):
-                cid = params.get("characterID") or params.get("id") or ""
+                cid = params.get("characterId") or params.get("characterID") or params.get("id") or ""
                 data = db.creation_work_detail(
                     self._int(params.get("userId") or 0, 0), cid)
                 if not data:
@@ -2071,7 +2100,8 @@ class Handler(BaseHTTPRequestHandler):
 
             if path == "/local/api/creation/export" and self.command in ("GET", "HEAD"):
                 scope = "worldbook" if params.get("scope") == "worldbook" else "full"
-                ids = [x for x in str(params.get("characterID") or "").split(",")
+                ids = [x for x in str(params.get("characterId") or params.get("characterID")
+                                      or "").split(",")
                        if x.strip()]
                 data = db.creation_export(
                     self._int(params.get("userId") or 0, 0), ids, scope)
@@ -2131,7 +2161,7 @@ class Handler(BaseHTTPRequestHandler):
                                            "msg": "危险操作需要确认"})
                 data = db.creation_delete_work(
                     self._int(body.get("userId") or 0, 0),
-                    str(body.get("characterID") or ""))
+                    str(body.get("characterId") or body.get("characterID") or ""))
                 self._note = "creation-delete"
                 return self.send_json({"code": 0, "msg": "已删除作品与世界书",
                                        "data": data})
@@ -2726,6 +2756,10 @@ class Handler(BaseHTTPRequestHandler):
                 history.append(Message(
                     role="user" if row["role"] == "user" else "assistant",
                     content=text, id=row["id"]))
+        # 记忆召回预取：入口处已提前启动；这里同 key 直接复用（兜底其它调用方）
+        Handler._recall_prefetch(uid, sid, cid,
+                                 Handler._recall_query_from(history, message),
+                                 Handler._recall_segments(history, message))
         # 历史里的 content_llm 已去掉状态栏标签：从原始 content 里找最近一次的数值。
         schema = Handler._stats_schema(ch if payload else {})
         # 平台数值规则只从库里读一次：全局 + 当前角色覆盖合并
@@ -2780,14 +2814,6 @@ class Handler(BaseHTTPRequestHandler):
             stat_meta=meta,
             stats_schema=schema,
         )
-
-    @staticmethod
-    def _llm_messages(uid: int | None, sid: str, cid: str, name: str,
-                      message: str, aicg: bool | None = None,
-                      rate_id=None) -> list[dict]:
-        """取上下文 → 提示词组装（唯一引擎）。"""
-        ctx = Handler._chat_context(uid, sid, cid, name, message, aicg)
-        return Handler._prompt_messages(uid, sid, cid, ctx, rate_id)[0]
 
     @staticmethod
     def _stats_schema(ch: dict) -> dict:
@@ -3108,26 +3134,133 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------ 历史压缩
     @staticmethod
     def _compress_keep_rounds(uid: int | None, cid: str) -> int:
-        """最近保留多少轮原文不压（默认 6，可在 db 配置 llm_compress_keep_rounds 覆盖）。"""
-        cfg = db.get_config("llm_compress_keep_rounds") or {}
-        val = cfg.get("value") if isinstance(cfg, dict) else cfg
+        """最近保留多少轮原文不压。
+
+        优先级：角色级 promptEngine.memory.compressKeepRounds
+                → db 配置 llm_compress_keep_rounds → 常量 6。
+        范围统一钳在 1..COMPRESS_KEEP_MAX_ROUNDS。
+        """
+        saved = db.get_config(f"promptEngine:{int(uid or 0)}:{cid}") or {}
+        mem = saved.get("memory") if isinstance(saved.get("memory"), dict) else {}
         try:
-            rounds = int(val)
+            rounds = int(mem.get("compressKeepRounds"))
         except (TypeError, ValueError):
-            rounds = COMPRESS_KEEP_ROUNDS
+            rounds = 0
+        if rounds <= 0:
+            cfg = db.get_config("llm_compress_keep_rounds") or {}
+            val = cfg.get("value") if isinstance(cfg, dict) else cfg
+            try:
+                rounds = int(val)
+            except (TypeError, ValueError):
+                rounds = COMPRESS_KEEP_ROUNDS
         return max(1, min(COMPRESS_KEEP_MAX_ROUNDS, rounds))
 
     @staticmethod
+    def _param_num(saved, key: str, default, lo, hi, as_int: bool = False):
+        """读模型参数：非数字 / NaN / 无穷 → 默认值，越界 → 钳制。
+
+        与保存校验同规（越界钳制、非法值不落地），保证库里脏值不会原样下发。
+        """
+        raw = (saved or {}).get(key) if isinstance(saved, dict) else None
+        if isinstance(raw, bool) or raw is None:
+            return default
+        try:
+            num = float(raw)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(num):
+            return default
+        num = max(float(lo), min(float(hi), num))
+        return int(round(num)) if as_int else num
+
+    @staticmethod
+    def _model_config_clean(payload, strict: bool = False):
+        """模型参数的保存校验（与前端 MODEL_RANGE 完全一致）。
+
+        策略：数字越界 → 钳制到范围内；非数字 / NaN / 无穷 → 不落地。
+        strict=True（保存）：遇到非法值整包拒绝，返回 ( {}, 错误文案 )；
+        strict=False（读取）：逐项丢弃脏值，返回 ( 干净值, 首个错误文案 )。
+        """
+        out: dict = {}
+        errors: list[str] = []
+        src = payload if isinstance(payload, dict) else {}
+        for key, (lo, hi, typ) in MODEL_PARAM_RANGES.items():
+            if key not in src:
+                continue
+            raw = src[key]
+            bad = ""
+            if isinstance(raw, bool) or raw is None:
+                bad = f"{key} 必须是数字"
+            else:
+                try:
+                    num = float(raw)
+                except (TypeError, ValueError):
+                    bad = f"{key} 必须是数字"
+                else:
+                    if not math.isfinite(num):
+                        bad = f"{key} 不能是 NaN 或无穷大"
+            if bad:
+                errors.append(bad)
+                if strict:
+                    return {}, bad
+                continue
+            num = max(float(lo), min(float(hi), num))
+            out[key] = int(round(num)) if typ is int else float(num)
+        return out, (errors[0] if errors else "")
+
+    @staticmethod
     def _output_budget(uid: int | None, rate_id) -> int:
-        """本轮输出 token 预算（发送前预判要和它一起算目标输入）。"""
+        """本轮输出 token 预算（发送前预裁剪用）。
+
+        保存值先钳 256–8192，再保证输入至少留窗口的 1/4（不低于 512 token）：
+        输出预算最多 window - 输入保底 - 64。这样「最大回复长度」调大也不会
+        把输入空间挤成负数、更不会关闭预裁剪。
+        """
         who = int(uid or 0)
         mid = str(rate_id or "0").strip() or "0"
         saved = db.get_config(f"modelConfig:{who}:{mid}") or {}
+        want = Handler._param_num(saved, "maxTokens", MODEL_PARAM_DEFAULTS["maxTokens"],
+                                  MODEL_OUTPUT_MIN, MODEL_OUTPUT_MAX, True)
+        window = int(Handler._prompt_config(uid, "", rate_id)
+                     .get("contextWindow") or 8192)
+        reserve = max(MODEL_INPUT_RESERVE_MIN,
+                      int(round(window * MODEL_INPUT_RESERVE_RATIO)))
+        cap = max(MODEL_OUTPUT_MIN, window - reserve - 64)
+        return max(MODEL_OUTPUT_MIN, min(MODEL_OUTPUT_MAX, want, cap))
+
+    @staticmethod
+    def _note_sent_params(uid: int | None, stream_key: str, rate_id,
+                          params: dict, est: int) -> None:
+        """记录本轮真实下发参数（面板只读展示），被压低时打一行日志。"""
         try:
-            want = int(saved.get("maxTokens") or 8192) if isinstance(saved, dict) else 8192
-        except (TypeError, ValueError):
-            want = 8192
-        return max(256, min(8192, want))
+            mid = str(rate_id or "0").strip() or "0"
+            sid = str(stream_key or "").split(":", 1)[-1]
+            sent = int(params.get("max_tokens") or 0)
+            saved = Handler._param_num(
+                db.get_config(f"modelConfig:{int(uid or 0)}:{mid}") or {},
+                "maxTokens", MODEL_PARAM_DEFAULTS["maxTokens"],
+                MODEL_OUTPUT_MIN, MODEL_OUTPUT_MAX, True)
+            window = int(Handler._prompt_config(uid, "", rate_id)
+                         .get("contextWindow") or 8192)
+            rec = {
+                "temperature": round(float(params.get("temperature") or 0.0), 3),
+                "topP": round(float(params.get("top_p") or 0.0), 3),
+                "presencePenalty": round(float(params.get("presence_penalty") or 0.0), 3),
+                "frequencyPenalty": round(float(params.get("frequency_penalty") or 0.0), 3),
+                "maxTokens": sent,
+                "maxTokensSaved": saved,
+                "inputTokens": int(est or 0),
+                "contextWindow": window,
+                "at": db.now_iso(),
+            }
+            with _LAST_MODEL_PARAMS_LOCK:
+                _LAST_MODEL_PARAMS[(int(uid or 0), sid, mid)] = rec
+            if sent < saved:
+                print(f"[model] max_tokens 被上下文压低：设定 {saved} → 实际 {sent}"
+                      f"（输入约 {est} token，窗口 {window}）",
+                      file=sys.stderr, flush=True)
+        except Exception:                            # noqa: BLE001  观测失败不影响请求
+            pass
 
     @staticmethod
     def _log_compression(kind: str, uid, sid, cid, before: int, after: int,
@@ -3156,28 +3289,36 @@ class Handler(BaseHTTPRequestHandler):
     def _model_params(uid: int | None, rate_id,
                       messages: list[dict] | None = None) -> dict:
         """「对话设置」里保存的模型参数 → llm.chat* 的关键字参数。
-        用户没存过就回 {}，保持 llm.py 里的默认行为不变。"""
+
+        默认值必须真正下发（0.7 / 0.8 / 0 / 0）：面板显示多少，请求体就是多少；
+        不再用「没存过就不传」把默认值交给 llm.py 的形参兜底（那里是 0.7，
+        但 top_p / 惩罚会落到上游自己的默认值，与面板显示不一致）。
+        """
         who = int(uid or 0)
         mid = str(rate_id or "0").strip() or "0"
         saved = db.get_config(f"modelConfig:{who}:{mid}") or {}
-        out: dict = {}
-        if "temperature" in saved:
-            out["temperature"] = float(saved["temperature"])
-        if "maxTokens" in saved:
-            out["max_tokens"] = int(saved["maxTokens"])
-        for src, dst in (("topP", "top_p"), ("presencePenalty", "presence_penalty"),
-                         ("frequencyPenalty", "frequency_penalty")):
-            if src in saved:
-                out[dst] = float(saved[src])
-        # 不显式下发 max_tokens 时很多上游按很小的默认值截断，回复会在半句处停住
-        out.setdefault("max_tokens", 8192)
+        out: dict = {
+            "temperature": Handler._param_num(
+                saved, "temperature", MODEL_PARAM_DEFAULTS["temperature"], 0, 1),
+            "top_p": Handler._param_num(
+                saved, "topP", MODEL_PARAM_DEFAULTS["topP"], 0, 1),
+            "presence_penalty": Handler._param_num(
+                saved, "presencePenalty", MODEL_PARAM_DEFAULTS["presencePenalty"], 0, 1),
+            "frequency_penalty": Handler._param_num(
+                saved, "frequencyPenalty", MODEL_PARAM_DEFAULTS["frequencyPenalty"], 0, 1),
+            "max_tokens": Handler._param_num(
+                saved, "maxTokens", MODEL_PARAM_DEFAULTS["maxTokens"],
+                MODEL_OUTPUT_MIN, MODEL_OUTPUT_MAX, True),
+        }
         if messages:
-            # 输出预算 = min(8192, 上下文窗口 - 输入估算 - 64)，下限 256
+            # 实际下发值 = min(设定值, 窗口 - 输入估算 - 64)，下限 256。
+            # 预裁剪已保证输入留出 _output_budget 的空间，正常情况下这里等于设定值。
             window = int(Handler._prompt_config(uid, "", rate_id)
                          .get("contextWindow") or 8192)
             est = estimate_messages(messages)
-            budget = min(8192, window - est - 64)
-            out["max_tokens"] = max(256, min(int(out["max_tokens"]), budget))
+            budget = min(MODEL_OUTPUT_MAX, window - est - 64)
+            out["max_tokens"] = max(MODEL_OUTPUT_MIN,
+                                    min(int(out["max_tokens"]), budget))
         prof = db.llm_profile(rate_id)     # 接入级格式差异（字段名 / stop / 额外参数）
         if prof:
             out["profile"] = prof
@@ -3214,10 +3355,23 @@ class Handler(BaseHTTPRequestHandler):
         "mmr": True, "mmrLambda": 0.7, "queryTimeout": 3.0,
         "capacity": 300, "clusterThreshold": 0.85, "dedupThreshold": 0.92,
         "archiveDays": 60, "archiveImportance": 0.35,
+        # 新召回模块：请求入口后台预取，prompt 组装最多等 waitMs；
+        # version=4：8 秒等待窗口 + 20 条精排（实测 6 秒会被降频后的精排顶穿），
+        # 正常负载下完整链路 100% 进 prompt；waitMs 是上限，召回完成即返回。
+        # 存量配置里被深合并写死的旧默认值由 _recall_cfg 按 version 迁移。
+        "recall": {
+            "version": 4,
+            "enabled": True, "topK": 8, "waitMs": 8000, "rerankTop": 20,
+            "mmrLambda": 0.7, "singleTimeoutMs": 1500,
+            "totalTimeoutMs": 8000, "modelPath": "", "rerankPath": "",
+        },
     }
 
-    # OpenAI 兼容 embedding provider（与 llm_providers 的 profile 风格一致）
+    # OpenAI 兼容 embedding provider（与 llm_providers 的 profile 风格一致）；
+    # provider=local 时改走本地 TF-IDF + LSA，不再需要 base_url/api_key。
     EMBEDDING_DEFAULTS = {
+        "provider": "", "local_enabled": False,
+        "local_model": "local-lsa", "local_dim": 128,
         "enabled": False, "base_url": "", "api_key": "", "model": "",
         "dimensions": 0, "batch_size": 16, "timeout": 30.0, "max_retries": 2,
     }
@@ -3234,6 +3388,44 @@ class Handler(BaseHTTPRequestHandler):
                 cfg[key] = saved[key]
         return cfg
 
+    # 历史版本 recall 的速度默认值：迁移时据此判断哪些字段是用户真改过的
+    RECALL_V2_DEFAULTS = {"waitMs": 5000, "totalTimeoutMs": 5500,
+                          "rerankTop": 20, "singleTimeoutMs": 1500}
+    RECALL_V3_DEFAULTS = {"waitMs": 6000, "totalTimeoutMs": 6000,
+                          "rerankTop": 20, "singleTimeoutMs": 1500}
+
+    @staticmethod
+    def _recall_cfg(mem: dict) -> dict:
+        """recall 配置：默认值 ← 角色级覆盖；version<4 的存量配置走迁移。
+
+        旧版默认值曾被深合并写进存量配置（v1: 300/2500/8/800，v2: 5000/5500/20/1500，
+        v3: 6000/6000/20/1500），直接合并会让老值锁死。迁移规则：
+          · 无 version / v1：速度项全部回落到新默认；
+          · v2 / v3：等于各自版本默认值的速度项回落到新默认，
+            用户真改过的（与对应版本默认不同）保留；
+          · 所有版本都保留用户显式设过的 enabled/topK/mmrLambda/模型路径。
+        任何一次 promptConfig/saveByCharacter 都会写入当前版本号，之后按普通深合并。
+        """
+        base = dict(Handler.MEMORY_DEFAULTS["recall"])
+        saved = mem.get("recall") if isinstance(mem.get("recall"), dict) else {}
+        try:
+            ver = int(saved.get("version") or 1)
+        except (TypeError, ValueError):
+            ver = 1
+        if ver < int(base["version"]):
+            for key in ("enabled", "topK", "mmrLambda", "modelPath", "rerankPath"):
+                if saved.get(key) not in (None, ""):
+                    base[key] = saved[key]
+            speed_defaults = (Handler.RECALL_V3_DEFAULTS if ver >= 3
+                              else Handler.RECALL_V2_DEFAULTS if ver >= 2 else {})
+            for key, old in speed_defaults.items():
+                if key in saved and saved[key] != old:
+                    base[key] = saved[key]
+        else:
+            base.update(saved)
+        base["version"] = int(Handler.MEMORY_DEFAULTS["recall"]["version"])
+        return base
+
     @staticmethod
     def _memory_cfg(uid: int | None, cid: str) -> dict:
         """算法记忆配置：默认值 ← 角色级 promptEngine.memory 深合并。"""
@@ -3247,15 +3439,244 @@ class Handler(BaseHTTPRequestHandler):
                 cfg[key] = {**cfg[key], **val}
             elif key in Handler.MEMORY_DEFAULTS:
                 cfg[key] = val
+        cfg["recall"] = Handler._recall_cfg(mem)
         cfg["embedding"] = Handler._emb_cfg(uid)
         return cfg
+
+    # 召回预取：请求入口起线程跑 recall，prompt 组装时最多等 waitMs；
+    # 完成结果按 (用户, 会话, 归一化 query) 短期缓存，重复查询直接命中。
+    _RECALL_CACHE: dict = {}
+    _RECALL_CACHE_LOCK = threading.Lock()
+    _RECALL_CACHE_TTL = 20.0
+    _RECALL_CACHE_MAX = 64
 
     @staticmethod
     def _memory_query(ctx: ChatContext) -> str:
         """检索查询 = 最近 3 条历史 + 本轮输入（短文本，避免整段历史稀释词面命中）。"""
-        recent = [str(m.content or "") for m in (ctx.history or [])[-3:]]
-        recent.append(str(ctx.user_input or ""))
-        return " ".join(x for x in recent if x.strip())[:2000]
+        return Handler._recall_query_from(ctx.history, ctx.user_input)
+
+    @staticmethod
+    def _memory_segments(ctx: ChatContext) -> list[str]:
+        """检索查询的分段形式（供历史向量 hash 缓存跨轮复用）。"""
+        return Handler._recall_segments(ctx.history, ctx.user_input)
+
+    @staticmethod
+    def _recall_segments(history, message: str) -> list[str]:
+        """召回查询分段 = 最近 2 条历史 + 本轮输入（本轮输入只出现一次）。
+
+        请求入口已把本轮用户消息落库，history 末尾会带上它；这里先摘掉，
+        保证入口预取与 _chat_context 算出的查询串完全一致（同一缓存 key）。
+        """
+        cur = str(message or "").strip()
+        recent = [str(getattr(m, "content", "") or "").strip()
+                  for m in (history or [])]
+        if cur and recent and recent[-1] == cur:
+            recent = recent[:-1]
+        recent = [x for x in recent if x][-2:]
+        if cur:
+            recent.append(cur)
+        return recent
+
+    @staticmethod
+    def _recall_query_from(history, message: str) -> str:
+        return " ".join(Handler._recall_segments(history, message))[:2000]
+
+    @staticmethod
+    def _recall_query_early(uid: int, sid: str,
+                            message: str) -> tuple[str, list[str]]:
+        """请求入口（历史尚未构建）时用的轻量查询：只取最近 3 条消息。
+
+        产出与 _recall_query_from(history, message) 完全一致，保证预取缓存 key
+        与 prompt 组装阶段一致，不会重复召回；同时让召回与历史加载/上下文准备并行。
+        """
+        try:
+            rows = db.query(
+                "SELECT m.content, m.content_llm FROM chat_messages m"
+                " JOIN chat_threads t ON t.id=m.thread_id"
+                " WHERE t.user_id IS ? AND t.session_id=?"
+                " ORDER BY m.id DESC LIMIT 3", (uid, sid))
+        except Exception:                            # noqa: BLE001
+            rows = []
+        cur = str(message or "").strip()
+        segs: list[str] = []
+        for row in reversed(rows or []):
+            text = str(row["content_llm"] or "").strip()
+            if not text:
+                text = clean_history_for_llm(row["content"]).strip()
+            if text:
+                segs.append(text)
+        # 当前这条用户消息刚落库，会在最近几条里重复出现：摘掉后再补一份
+        if cur and segs and segs[-1] == cur:
+            segs = segs[:-1]
+        segs = [x for x in segs if x][-2:]
+        if cur:
+            segs.append(cur)
+        return " ".join(segs)[:2000], segs
+
+    @staticmethod
+    def _recall_overrides(recall_cfg: dict, keyword_only: bool = False) -> dict:
+        """记忆配置 → memory_recall 的参数；全部按毫秒换算成秒。"""
+        def _sec(key: str, default: float) -> float:
+            try:
+                return max(1.0, float(recall_cfg.get(key) or default)) / 1000.0
+            except (TypeError, ValueError):
+                return default / 1000.0
+
+        ov = {
+            "budget": _sec("totalTimeoutMs", 6000),
+            "single_timeout": _sec("singleTimeoutMs", 1500),
+            "rerank_top": int(recall_cfg.get("rerankTop") or 20),
+            "mmr_lambda": float(recall_cfg.get("mmrLambda") or 0.7),
+            "load_wait": 0.0,          # 预热交给启动线程，请求链路不等模型
+        }
+        if recall_cfg.get("modelPath"):
+            ov["embed_path"] = str(recall_cfg["modelPath"])
+        if recall_cfg.get("rerankPath"):
+            ov["rerank_path"] = str(recall_cfg["rerankPath"])
+        if keyword_only:
+            ov["keyword_only"] = True
+        return ov
+
+    @staticmethod
+    def _recall_gc(now: float) -> None:
+        cache = Handler._RECALL_CACHE
+        for key in [k for k, v in cache.items()
+                    if now - float(v.get("at") or 0.0) > Handler._RECALL_CACHE_TTL]:
+            cache.pop(key, None)
+        while len(cache) > Handler._RECALL_CACHE_MAX:
+            oldest = min(cache.items(), key=lambda kv: kv[1].get("at", 0.0))[0]
+            cache.pop(oldest, None)
+
+    @staticmethod
+    def _recall_start(uid: int, sid: str, cid: str, query: str,
+                      recall_cfg: dict,
+                      segments: list[str] | None = None) -> dict:
+        """同 key 复用进行中/刚完成的召回，否则起后台线程。"""
+        key = (int(uid or 0), str(sid or ""), str(query or ""))
+        now = time.monotonic()
+        with Handler._RECALL_CACHE_LOCK:
+            Handler._recall_gc(now)
+            ent = Handler._RECALL_CACHE.get(key)
+            if ent is not None:
+                return ent
+            ent = {"event": threading.Event(), "result": None,
+                   "error": "", "at": now, "thread": None}
+            Handler._RECALL_CACHE[key] = ent
+            print(f"[recall] 预取启动 key="
+                  f"{hashlib.sha1(str(key[2]).encode('utf-8')).hexdigest()[:8]}"
+                  f" 段数={len(segments or [])}", file=sys.stderr, flush=True)
+
+        top_k = int(recall_cfg.get("topK") or 8)
+        ov = Handler._recall_overrides(recall_cfg)
+        if segments:
+            # 最近几轮消息分段编码（内容 hash 缓存跨轮复用），查询向量在后台组装
+            ov["query_segments"] = [str(s or "") for s in segments]
+            ov["segment_weights"] = [1.0] * (len(segments) - 1) + [2.0]
+
+        def run():
+            try:
+                ent["result"] = memory_recall.recall(
+                    query, uid, cid, sid=sid, top_k=top_k, **ov)
+            except Exception as exc:                 # noqa: BLE001
+                ent["error"] = f"{type(exc).__name__}: {exc}"
+                print(f"[recall] 后台召回失败：{ent['error']}", file=sys.stderr)
+            finally:
+                ent["event"].set()
+
+        th = threading.Thread(target=run, name="memory-recall", daemon=True)
+        ent["thread"] = th
+        th.start()
+        return ent
+
+    @staticmethod
+    def _recall_mode(rows: list[dict]) -> str:
+        """按返回字段判断本轮结果来自完整链路还是降级/兜底。"""
+        if not rows:
+            return "空结果"
+        if all(it.get("rerank") is not None for it in rows):
+            return "完整链路"
+        if any(it.get("rerank") is not None for it in rows):
+            return "完整链路(部分精排)"
+        if any(it.get("cosine") is not None for it in rows):
+            return "降级(稠密,无精排)"
+        return "关键词兜底"
+
+    @staticmethod
+    def _recall_tag(rows: list[dict], mode: str) -> list[dict]:
+        """给本轮结果打来源标记（完整链路 / 关键词兜底），写进 prompt log。"""
+        for it in rows:
+            it["recall_mode"] = mode
+        return rows
+
+    @staticmethod
+    def _recall_results(uid: int, sid: str, cid: str, query: str,
+                        recall_cfg: dict,
+                        segments: list[str] | None = None) -> list[dict]:
+        """最多等 waitMs；只有超时/失败才改用关键词通道兜底。
+
+        兜底结果不写回预取缓存：后台完整链路结果到达后仍以成功结果为准，
+        同一 query 再次请求时若已就绪直接复用（_RECALL_CACHE 的 result）。
+        """
+        if not query.strip():
+            return []
+        t0 = time.monotonic()
+        top_k = int(recall_cfg.get("topK") or 8)
+        wait_ms = max(0.0, float(recall_cfg.get("waitMs") or 6000))
+        ent = None
+        try:
+            ent = Handler._recall_start(uid, sid, cid, query, recall_cfg,
+                                        segments=segments)
+            finished = ent["event"].wait(wait_ms / 1000.0)
+            if finished and ent.get("result") is not None:
+                rows = list(ent.get("result") or [])
+                mode = Handler._recall_mode(rows)
+                rows = Handler._recall_tag(rows, mode)
+                print(f"[recall] 注入={mode} 条数={len(rows)}"
+                      f" 等待={int((time.monotonic() - t0) * 1000)}ms"
+                      f" 后台耗时={int((time.monotonic() - float(ent.get('at') or t0)) * 1000)}ms",
+                      file=sys.stderr, flush=True)
+                return rows
+            if finished:
+                print(f"[recall] 后台召回失败（{ent.get('error') or 'empty'}），"
+                      "改用关键词通道", file=sys.stderr, flush=True)
+            else:
+                print(f"[recall] 等待 {int(wait_ms)}ms 未完成，改用关键词通道",
+                      file=sys.stderr, flush=True)
+        except Exception as exc:                     # noqa: BLE001
+            print(f"[recall] 预取等待失败：{exc}，改用关键词通道",
+                  file=sys.stderr, flush=True)
+
+        try:
+            fast = memory_recall.recall(
+                query, uid, cid, sid=sid, top_k=top_k,
+                **Handler._recall_overrides(recall_cfg, keyword_only=True)) or []
+            fast = Handler._recall_tag(fast, "关键词兜底")
+            print(f"[recall] 注入=关键词兜底(bm25) 条数={len(fast)}"
+                  f" 等待={int((time.monotonic() - t0) * 1000)}ms",
+                  file=sys.stderr, flush=True)
+            return fast
+        except Exception as exc:                     # noqa: BLE001
+            print(f"[recall] 关键词通道失败：{exc}", file=sys.stderr, flush=True)
+            return []
+
+    @staticmethod
+    def _recall_prefetch(uid: int | None, sid: str, cid: str, query: str,
+                         segments: list[str] | None = None) -> None:
+        """请求入口调用：配置检查通过就在后台启动召回，不阻塞。"""
+        if not uid or not sid or not str(query or "").strip():
+            return
+        try:
+            if not Handler._memory_enabled(uid, cid):
+                return
+            mem_cfg = Handler._memory_cfg(uid, cid)
+            recall_cfg = mem_cfg.get("recall") if isinstance(
+                mem_cfg.get("recall"), dict) else {}
+            if not mem_cfg.get("enabled", True) or not recall_cfg.get("enabled", True):
+                return
+            Handler._recall_start(uid, sid, cid, query, recall_cfg,
+                                  segments=segments)
+        except Exception as exc:                     # noqa: BLE001
+            print(f"[recall] 预取启动失败：{exc}", file=sys.stderr)
 
     @staticmethod
     def _first_mes(cid: str) -> str:
@@ -3275,15 +3696,16 @@ class Handler(BaseHTTPRequestHandler):
             set_token_alpha(Handler._token_alpha(ep[0], ep[2]))
         cfg = Handler._prompt_config(uid, cid, rate_id)
         entries = Handler._chat_worldbook(cid, uid)
-        mem_on, keep = Handler._summary_params(uid, cid) if uid else (False, 0)
+        mem_on = Handler._memory_enabled(uid, cid) if uid else False
         slots: dict = {}
         if uid and sid and mem_on:
             got = db.memory_slots(uid, sid)
             slots = {k: str(v.get("content") or "")
                      for k, v in (got or {}).items()
                      if str(v.get("content") or "").strip()}
-            if not slots and keep > 0:
+            if not slots:
                 # 旧表 chat_memories 只读兼容：还没有四槽时整段当 short_term
+                keep = Handler._compress_keep_rounds(uid, cid)
                 old = db.chat_memories(uid, cid, session_id=sid)[-max(1, keep):]
                 text = "\n".join(str(m.get("content") or "") for m in old
                                  if m.get("content"))
@@ -3293,22 +3715,45 @@ class Handler(BaseHTTPRequestHandler):
         anchor = pcfg.get("anchor") if isinstance(pcfg.get("anchor"), dict) else {}
         if anchor:
             cfg["anchor"] = anchor
-        # 算法记忆检索：相关性（BM25/余弦）+ 重要性 + 时近性，归一化加权 top-k
+        # 记忆召回：请求入口已在后台预取；这里最多等 waitMs，超时走关键词通道
         mem_cfg = Handler._memory_cfg(uid, cid)
-        cfg["memory"] = mem_cfg
+        recall_cfg = mem_cfg.get("recall") if isinstance(
+            mem_cfg.get("recall"), dict) else {}
         retrieved: list[dict] = []
-        if uid and sid and mem_on and mem_cfg.get("enabled", True):
+        recall_mode = ""
+        recall_wait = 0
+        t_prompt = time.monotonic()
+        if (uid and sid and mem_on and mem_cfg.get("enabled", True)
+                and recall_cfg.get("enabled", True)):
+            t_recall = time.monotonic()
             try:
-                retrieved = memory_engine.retrieve(
-                    uid, cid, sid, Handler._memory_query(ctx), mem_cfg)
+                retrieved = Handler._recall_results(
+                    uid, sid, cid, Handler._memory_query(ctx), recall_cfg,
+                    segments=Handler._memory_segments(ctx))
             except Exception as exc:                 # noqa: BLE001
-                print(f"[memory] 检索失败：{exc}", file=sys.stderr)
+                print(f"[recall] 检索失败：{exc}", file=sys.stderr)
                 retrieved = []
-            depth = int(mem_cfg.get("injectDepth", 4) or 4)
-            for it in retrieved:
-                it["injected_at"] = depth
+            recall_wait = int((time.monotonic() - t_recall) * 1000)
+            recall_mode = (str(retrieved[0].get("recall_mode") or "")
+                           if retrieved else "空结果")
+            block = memory_recall.build_injection(
+                retrieved, max_tokens=int(mem_cfg.get("maxTokens") or 600))
+            if block:
+                mem_cfg["injectedBlock"] = block
+                depth = int(mem_cfg.get("injectDepth", 4) or 4)
+                for it in retrieved:
+                    it["injected_at"] = depth
+        cfg["memory"] = mem_cfg
+        if uid and sid and mem_on:
+            _RECALL_STATS[(int(uid), str(sid), str(cid))] = {
+                "count": len(retrieved), "waitMs": int(recall_wait),
+                "at": db.now_iso()}
         messages = build_prompt(ctx, worldbook_entries=entries, slots=slots,
                                    retrieved=retrieved, config=cfg)
+        if recall_mode:
+            print(f"[recall] prompt 组装={int((time.monotonic() - t_prompt) * 1000)}ms"
+                  f" 检索等待={recall_wait}ms 注入={recall_mode}"
+                  f" 条数={len(retrieved)}", file=sys.stderr, flush=True)
         compact = [{k: v for k, v in it.items() if k != "vec"}
                    for it in retrieved]
         return messages, {"config": cfg, "worldbook": entries,
@@ -3336,106 +3781,12 @@ class Handler(BaseHTTPRequestHandler):
             return []
 
     @staticmethod
-    def _summary_params(uid: int | None, cid: str) -> tuple[bool, int]:
-        """「对话设置 → 记忆设置」：(是否启用记忆, 注入的记忆条数)。
-        没配置时用默认：启用、注入最近 3 条摘要。"""
+    def _memory_enabled(uid: int | None, cid: str) -> bool:
+        """「对话设置 → 记忆设置」总闸：关闭后不检索、不注入、不生成摘要与记忆。"""
         if not uid or not cid:
-            return False, 0
+            return False
         saved = db.get_config(f"summaryConfig:{int(uid)}:{cid}") or {}
-        enabled = saved.get("summaryEnabled", True)
-        rounds = saved.get("summaryReserveRounds", 3)
-        try:
-            rounds = max(0, min(10, int(rounds)))
-        except (TypeError, ValueError):
-            rounds = 3
-        return bool(enabled), rounds
-
-    def _ai_reply(self, uid: int | None, sid: str, cid: str, name: str,
-                  message: str, rate_id=None, aicg: bool | None = None,
-                  on_send=None, messages: list[dict] | None = None,
-                  ctx: ChatContext | None = None, meta: dict | None = None,
-                  rebuild=None) -> tuple[str, str]:
-        """配了模型接入 → 按 OpenAI 协议去问；没配接入才直接走本地（本地模式用于测试）。
-        开关「超时回退」关闭时，模型失败/超时抛 LLMError 由调用方报错，不自动切本地。
-        返回 (回复文本, 备注)。文本已经过选项改写成 <next_prompt>。
-        on_send：真正发包前的观察回调（Prompt 快照用）。
-        messages/ctx：非流式路径复用同一套 prepare 后的结果（含自定义设定与记忆）；
-        meta：回填 finish_reason 等元信息。"""
-        endpoint = self._llm_endpoint(rate_id)
-        if not endpoint:
-            if meta is not None:
-                meta["finish_reason"] = "local"
-            return wrap_next_prompts(self._local_reply(name, message)), "chat-local"
-
-        base, key, model = endpoint
-        if messages is None:
-            messages = (Handler._prompt_messages(uid, sid, cid, ctx, rate_id)[0]
-                        if ctx is not None else
-                        self._llm_messages(uid, sid, cid, name, message, aicg,
-                                           rate_id))
-        if os.environ.get("MISSAI_DEBUG_PROMPT") == "1":
-            print("[prompt]", json.dumps(messages, ensure_ascii=False),
-                  file=sys.stderr, flush=True)
-        try:
-            cur_msgs = messages
-            overflow_retried = False
-            while True:
-                try:
-                    text, info = llm.chat_with_meta(
-                        base, key, model, cur_msgs, timeout=90.0,
-                        on_send=on_send,
-                        **self._model_params(uid, rate_id, cur_msgs))
-                    break
-                except llm.LLMError as exc:
-                    if exc.code != "context_overflow" or overflow_retried:
-                        raise
-                    overflow_retried = True
-                    before = estimate_messages(messages)
-                    keep = Handler._compress_keep_rounds(uid, cid) * 2
-                    compressed = False
-                    if rebuild is not None:
-                        try:
-                            compressed = bool(self._maybe_summarize(
-                                uid, sid, cid, keep=keep))
-                            cur_msgs = rebuild()
-                        except Exception as cexc:        # noqa: BLE001
-                            print(f"[compress] 同步压缩失败，回退确定性裁剪：{cexc}",
-                                  file=sys.stderr)
-                    if not compressed:
-                        cur_msgs = shrink_for_overflow(messages, 3, keep)
-                        Handler._log_compression(
-                            "sync-fallback", uid, sid, cid, before,
-                            estimate_messages(cur_msgs), "确定性裁剪",
-                            f"keep={keep}条")
-                    elif estimate_messages(cur_msgs) >= before:
-                        # 摘要已写入，但重建后没变小 → 仍需裁剪才能重试成功
-                        cur_msgs = shrink_for_overflow(cur_msgs, 3, keep)
-                        Handler._log_compression(
-                            "sync-trim", uid, sid, cid, before,
-                            estimate_messages(cur_msgs), "摘要未减量，补裁剪",
-                            f"keep={keep}条")
-                    print(f"[llm] 上下文超限 → "
-                          f"{'已压缩' if compressed else '裁剪'}后重试一次：{exc}",
-                          file=sys.stderr)
-        except llm.LLMError as exc:
-            print(f"[llm] 调用失败（{model} @ {base}）：{exc}", file=sys.stderr)
-            if not self._timeout_local_fallback():
-                raise                     # 本地模式不作保底 → 让调用方直接报错
-            if meta is not None:
-                meta["finish_reason"] = "error"
-            return (wrap_next_prompts(self._local_reply(name, message)),
-                    "chat-llm-failed")
-        if meta is not None:
-            meta.update(info or {})
-        usage = info.get("usage") if isinstance(info, dict) else {}
-        actual = int((usage or {}).get("prompt_tokens") or 0) if isinstance(usage, dict) else 0
-        if actual:
-            Handler._calibrate_tokens(base, model, estimate_messages(cur_msgs),
-                                      actual)
-        final = wrap_next_prompts(normalize_say_blocks(text))
-        final = self._ensure_format(base, key, model, cur_msgs, final, uid, sid,
-                                    on_send=on_send)
-        return final, f"chat-llm:{model}"
+        return bool(saved.get("summaryEnabled", True))
 
     @staticmethod
     def _prev_status(uid: int | None, sid: str) -> str:
@@ -3487,6 +3838,7 @@ class Handler(BaseHTTPRequestHandler):
                 + f"【本轮回复】\n{text}\n\n【补全要求】\n{ask}"},
         ]
         try:
+            # 后台调用参数写死，不受「对话设置 → 模型参数」影响（面板只管正文一轮）
             got = llm.chat(base, key, model, req, timeout=45.0,
                            temperature=0.3, max_tokens=300, on_send=on_send)
         except llm.LLMError as exc:
@@ -3558,7 +3910,7 @@ class Handler(BaseHTTPRequestHandler):
     def _local_creation(self, rel: str, params: dict, payload: dict,
                         uid: int | None, body: bytes = b"") -> bool:
         if rel == "narratiumCharacter/findNarratiumCharacterByCharacterID":
-            cid = params.get("characterID") or ""
+            cid = params.get("characterId") or params.get("characterID") or ""
             # 镜像角色详情（原站整包，profile 页本地渲染任意角色的关键）
             mirrored = db.character_get(cid)
             if mirrored is not None:
@@ -3577,8 +3929,9 @@ class Handler(BaseHTTPRequestHandler):
         # 平台数值规则：全局默认 + 角色专属覆盖（同名属性角色优先）
         if rel.startswith("narratiumStatRules/"):
             sub = rel.split("/", 1)[1]
-            stat_cid = str(params.get("character_id") or params.get("characterID")
-                           or payload.get("character_id")
+            stat_cid = str(params.get("characterId") or params.get("characterID")
+                           or params.get("character_id")
+                           or payload.get("characterId")
                            or payload.get("characterID") or "").strip()
 
             def stat_rule_view(extra: dict | None = None) -> dict:
@@ -3588,7 +3941,7 @@ class Handler(BaseHTTPRequestHandler):
                     "meta": db.list_stat_rule_meta(stat_cid),
                     "scope": db.stat_rule_scope(stat_cid),
                     "overrides": db.list_stat_rule_overrides(stat_cid),
-                    "characterID": stat_cid,
+                    "characterId": stat_cid,
                 }
                 if extra:
                     data.update(extra)
@@ -3675,8 +4028,8 @@ class Handler(BaseHTTPRequestHandler):
         # 世界书读取（不需要登录，支持离线镜像数据）
         if rel.startswith("narratiumWorldbookEntry/"):
             sub = rel.split("/", 1)[1]
-            cid = (params.get("characterID") or payload.get("characterID")
-                   or payload.get("characterId") or "")
+            cid = (params.get("characterId") or params.get("characterID")
+                   or payload.get("characterId") or payload.get("characterID") or "")
             if sub == "getEntriesByCharacterID":
                 entries = db.list_worldbook(uid, cid, custom=False) if uid else []
                 if not entries and cid:
@@ -3742,7 +4095,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if rel == "work":
             if self.command == "DELETE":
-                cid = db.work_identity(payload) or params.get("characterID") or ""
+                cid = db.work_identity(payload) or params.get("characterId") \
+                    or params.get("characterID") or ""
                 cid = str(cid or "").strip()
                 # 连带清理该作品的图片资源：封面 + 所有 CG 图（磁盘文件 + config_cache）
                 if cid:
@@ -3790,11 +4144,11 @@ class Handler(BaseHTTPRequestHandler):
                                 pass
                     except Exception:  # noqa: BLE001
                         pass
-                return self._local_ok({"characterID": cid,
+                return self._local_ok({"characterId": cid,
                                        "deleted": db.delete_work(uid, cid)}, "work-delete")
             if not db.work_identity(payload):
                 payload = dict(payload)
-                payload["characterID"] = f"char-{uuid.uuid4()}"
+                payload["characterId"] = f"char-{uuid.uuid4()}"
             saved = db.save_work(uid, payload)
             if saved is None:
                 return False
@@ -3824,7 +4178,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if rel in ("work/publish", "work/unpublish",
                    "work/schedule", "work/schedule/cancel"):
-            cid = db.work_identity(payload) or params.get("characterID") or ""
+            cid = db.work_identity(payload) or params.get("characterId") \
+                or params.get("characterID") or ""
             status = {"work/publish": "published", "work/unpublish": "draft",
                       "work/schedule": "scheduled",
                       "work/schedule/cancel": "draft"}[rel]
@@ -3842,7 +4197,7 @@ class Handler(BaseHTTPRequestHandler):
             when = payload.get("scheduledTime") if rel == "work/schedule" else ""
             saved = db.set_work_status(uid, cid, status, when)
             if saved is None:
-                saved = {"characterID": cid, "publishStatus": status,
+                saved = {"characterId": cid, "publishStatus": status,
                          "updatedAt": db.now_iso()}
             if rel == "work/publish" and status == "published":
                 db.publish_to_public(uid, cid)      # 发布 → 同步进公开库（探索/首页可见）
@@ -3869,7 +4224,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._local_ok(db.get_creative_refs(uid, cid), "refs-get")
 
         if rel == "narratium/work/public":
-            cid = params.get("characterID") or ""
+            cid = params.get("characterId") or params.get("characterID") or ""
             local = db.get_work(uid, cid)
             if local is None:
                 return False                # 本地没有 → 反代去线上读作品页
@@ -3992,6 +4347,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             started = False
             try:
+                # 参数只算一次：既用于下发，也用于面板展示（真实值，不估算）
+                params = self._model_params(uid, rate, cur_msgs)
+                Handler._note_sent_params(uid, stream_key, rate, params,
+                                          estimate_messages(cur_msgs))
                 for piece in llm.chat_stream(base, key, model, cur_msgs,
                                              timeout=(10.0 if fb else 60.0),
                                              on_send=on_send,
@@ -4000,8 +4359,7 @@ class Handler(BaseHTTPRequestHandler):
                                                         if meta is not None else None),
                                              stream_key=stream_key,
                                              include_usage=include_usage,
-                                             **self._model_params(uid, rate,
-                                                                  cur_msgs)):
+                                             **params):
                     started = True
                     yield piece
                 usage = (meta or {}).get("usage") if isinstance(meta, dict) else {}
@@ -4117,8 +4475,7 @@ class Handler(BaseHTTPRequestHandler):
         模型不可用 / 关闭记忆 → 返回 False，不阻塞回复。
         """
         try:
-            mem_on, _keep = Handler._summary_params(uid, cid)
-            if not mem_on or not sid:
+            if not Handler._memory_enabled(uid, cid) or not sid:
                 return False
             with _SUMMARY_LOCK:
                 rows = db.query(
@@ -4189,6 +4546,7 @@ class Handler(BaseHTTPRequestHandler):
                 + "【本次需要总结的对话】\n" + seg_text + "\n\n"
                 + "【最近上下文，仅帮助理解】\n" + overlap_text)
             out = ""
+            # 后台摘要参数写死，不受「对话设置 → 模型参数」影响（面板只管正文一轮）
             for piece in llm.chat_stream(base, key, model,
                                          [{"role": "user", "content": prompt}],
                                          timeout=20.0, max_tokens=900,
@@ -4249,8 +4607,7 @@ class Handler(BaseHTTPRequestHandler):
             if not uid or not sid or not cid:
                 return
             cfg = Handler._memory_cfg(uid, cid)
-            mem_on, _keep = Handler._summary_params(uid, cid)
-            if not cfg.get("enabled", True) or not mem_on:
+            if not cfg.get("enabled", True) or not Handler._memory_enabled(uid, cid):
                 return
             with _MEMORY_LOCK:
                 # 抽稀：每 extractEvery 轮才调一次 LLM，其余轮只用规则（零成本）
@@ -4266,6 +4623,7 @@ class Handler(BaseHTTPRequestHandler):
                         base, key_, model = endpoint
                         convo = f"用户：{user_text}\nAI：{ai_text}"[:3000]
                         try:
+                            # 后台记忆抽取参数写死，不受「对话设置 → 模型参数」影响
                             out = llm.chat(
                                 base, key_, model,
                                 [{"role": "user",
@@ -4424,6 +4782,26 @@ class Handler(BaseHTTPRequestHandler):
                         limit: int = 32) -> int:
         """把还没建当前模型向量的活跃记忆补齐；同内容 hash 先直接复用。"""
         eb = cfg.get("embedding") or {}
+        if str(eb.get("provider") or "").strip().lower() == "local":
+            from roleplay_core import local_embedder
+            meta = local_embedder.active_model(
+                str(eb.get("local_model") or local_embedder.DEFAULT_MODEL_NAME))
+            if not meta:
+                return 0
+            model_id = local_embedder.model_id(meta)
+            todo = db.items_missing_vector(uid, cid, sid, model_id, limit=limit)
+            stored = 0
+            for it in todo:
+                text = " ".join(str(it.get(k) or "")
+                                for k in ("content", "subject", "object"))
+                vec = local_embedder.project(text, meta)
+                if vec:
+                    db.set_memory_vector(int(it["id"]), vec, model_id)
+                    stored += 1
+            if stored:
+                local_embedder.maybe_retrain_async(
+                    str(eb.get("local_model") or local_embedder.DEFAULT_MODEL_NAME))
+            return stored
         if not eb.get("enabled") or not eb.get("base_url") or not eb.get("model"):
             return 0
         model_id = memory_engine.embedding_model_id(cfg)
@@ -4471,473 +4849,11 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[memory] 向量补算完成 {done} 条（模型 {model_id}）", file=sys.stderr)
         return done
 
-    def _local_chat_stream(self, payload: dict, uid: int | None, guest: bool) -> bool:
-        """流式对话：上游逐段拿 → 逐帧下发（前端边收边渲染）。
-
-        SSE 帧序：content × N → usage → done → [DONE]
-        尾部的 A/B/C/D 选项块要等整段结束才知道边界，所以 stream_hold_start()
-        把「最后一行 + 尾部选项块」先攒住，收尾时统一改写成 <next_prompt> 再补发。
-        """
-        sid = str(payload.get("sessionId") or "").strip()
-        message = str(payload.get("message") or payload.get("content") or "")
-        cid = str(payload.get("characterId") or payload.get("characterID") or "")
-        if not sid:
-            view = db.ensure_chat_session(
-                uid, cid, initial_stats=Handler._initial_stats(cid))
-            sid = view["sessionId"]
-        else:
-            view = db.ensure_chat_session(
-                uid, cid, session_id=sid, initial_stats=Handler._initial_stats(cid))
-        name = str(view.get("characterName") or "角色")
-        rate = self._rate_id(payload)
-        # D3：会话还是空的 → 后端补写一次角色开场白（只写一次）
-        if not guest:
-            self._maybe_first_mes(uid, sid, cid)
-        # 本次请求的 AICG 开关（前端传 enableAICG；缺省则回落到库内偏好）
-        aicg = payload.get("enableAICG") if isinstance(payload.get("enableAICG"), bool) else None
-
-        # 先校验积分再落库：余额不足时不要留下一条孤立 user 消息（否则下一轮会连续两条 user）
-        if not guest and uid:
-            quote = db.chat_quote(uid, message)
-            if quote["cost"] > 0 and quote["balance"] < quote["cost"]:
-                self._sse_start("chat-stream/insufficient-points")
-                self._sse_frame({
-                    "type": "error",
-                    "message": (f"积分不足：本次需要 {quote['cost']} 积分，当前余额 "
-                                f"{quote['balance']}。可在账号中心签到或联系管理员充值。"),
-                })
-                self._sse_frame({"type": "done", "assistantMessageId": 0,
-                                 "userMessageId": 0})
-                self._sse_frame(None)
-                return True
-
-        user_mid = 0
-        if message.strip():
-            user_mid = int(db.record_chat_message(uid, sid, "user", message) or 0)
-        turn_id = uuid.uuid4().hex[:16]
-        stop_event = _register_stream(uid, sid)
-
-        endpoint = self._llm_endpoint(rate)
-        fb = self._timeout_local_fallback()     # 控制台「超时回退」开关（默认关）
-        llm_meta: dict = {}
-        sent: dict = {"messages": None}
-        ctx_box: dict = {}          # 上下文超限 L4 重建时要用到本回合 ctx
-
-        def _context(req: ChatRequest) -> ChatContext:
-            return self._chat_context(uid, req.session_id, req.character_id,
-                                      req.character_name, req.user_input,
-                                      req.enable_aicg)
-
-        def _prepare(ctx: ChatContext, msgs: list[dict]) -> list[dict]:
-            # 整段重建（世界书触发器/深度、角色卡字段、记忆都已就位），
-            # 这里只补输入栏「自定」设定。
-            ctx_box["ctx"] = ctx
-            msgs, meta = self._prompt_messages(uid, sid, cid, ctx, rate)
-            sent["prompt"] = meta
-            self._inject_custom(msgs, payload, message)
-            # 发送前预判：估算超「窗口 - 输出预算 - 64」→ 确定性裁剪（无网络、无延迟）
-            try:
-                window = int(Handler._prompt_config(uid, cid, rate)
-                             .get("contextWindow") or 8192)
-                target = window - Handler._output_budget(uid, rate) - 64
-                before = estimate_messages(msgs)
-                if target > 0 and before > target:
-                    keep_rounds = Handler._compress_keep_rounds(uid, cid)
-                    msgs, dropped = compress_for_budget(msgs, target, keep_rounds)
-                    after = estimate_messages(msgs)
-                    Handler._log_compression(
-                        "pre", uid, sid, cid, before, after,
-                        f"-{dropped}条历史", f"keep={keep_rounds}轮")
-                    if dropped:
-                        # 被裁掉的历史进后台压缩，下一轮以摘要/记忆槽生效
-                        Handler._enqueue_compress(uid, sid, cid)
-            except Exception as exc:                 # noqa: BLE001  裁剪失败不影响本轮
-                print(f"[compress] 发送前裁剪失败：{exc}", file=sys.stderr)
-            if os.environ.get("MISSAI_DEBUG_PROMPT") == "1":
-                print("[prompt]", json.dumps(msgs, ensure_ascii=False),
-                      file=sys.stderr, flush=True)
-            sent["messages"] = msgs
-            return msgs
-
-        def _post(text: str, ctx: ChatContext) -> dict:
-            # 收尾拦截：模型点的 <image>ID</image> 换真实地址；没点图则按权重兜底
-            cg_data = self._cg_payload(uid, cid, ctx.enable_aicg)
-            return process_output(text, cg_data, enable_cg=bool(cg_data),
-                                  current_user_msg=message, matcher=_match_cg,
-                                  schema=self._clamp_schema(ctx))
-
-        if guest:
-            # 试玩流（guestChat）的客户端只认 {"type":"message","content":…}，
-            # 而且要 guest_info_updated 收尾 —— 单帧下发，保持原来的协议。
-            # 与登录流共用同一套准备/后处理（自定义设定、格式钳制），只是不写记忆/状态/计费。
-            gmeta = llm_meta
-            try:
-                ctx = self._chat_context(uid, sid, cid, name, message, aicg)
-                gmsgs = _prepare(ctx, [])
-                reply, gsrc = self._ai_reply(uid, sid, cid, name, message, rate, aicg,
-                                             messages=gmsgs, ctx=ctx, meta=gmeta,
-                                             rebuild=lambda: _prepare(ctx, []))
-                out = _post(reply, ctx)
-                display, tagged = out["display_text"], out["tagged_text"]
-            except llm.LLMError as exc:
-                # 开关「超时回退」关闭：不自动切本地 → 把错误当回复内容发给试玩端
-                reply = f"模型回复失败：{exc}"
-                gsrc = "chat-llm-failed"
-                display = tagged = reply
-            except Exception as exc:                    # noqa: BLE001
-                if user_mid:
-                    try:
-                        db.delete_chat_message(uid, user_mid)
-                    except Exception:                   # noqa: BLE001
-                        pass
-                _unregister_stream(uid, sid, stop_event)
-                self._sse_start("guest-chat/error")
-                self._sse_frame({"type": "error", "message": f"生成失败：{exc}"})
-                self._sse_frame({"type": "done", "assistantMessageId": 0,
-                                 "userMessageId": 0})
-                self._sse_frame(None)
-                return True
-            try:
-                aid = int(db.record_chat_message(uid, sid, "assistant", tagged,
-                                                 clean_for_storage(tagged)) or 0)
-                self._sse_start(f"guest-chat/{gsrc}")
-                self._sse_frame({"type": "message", "content": display})
-                self._sse_frame({"type": "guest_info_updated", "maxChats": 20,
-                                 "remainingChats": 19, "totalChats": 20})
-                self._sse_frame({"type": "done", "assistantMessageId": aid,
-                                 "userMessageId": user_mid,
-                                 "finishReason": gmeta.get("finish_reason", ""),
-                                 "truncated": (str(gmeta.get("finish_reason") or "")
-                                               == "length")})
-                self._sse_frame(None)
-            finally:
-                _unregister_stream(uid, sid, stop_event)
-            return True
-
-        # Prompt 快照：钩子挂在真正发包处（llm.chat/chat_stream 的 on_send），
-        # 本回合所有请求（主对话 + 补格式，含 404 重试）先收集，收尾时汇总写一条
-        prompt_hits: list[dict] = []
-        send_hook = (prompt_hits.append
-                     if (endpoint and payload.get("promptLog")) else None)
-        self._sse_start("chat-stream/self")
-
-        request = ChatRequest(
-            session_id=sid, character_id=cid, character_name=name,
-            user_input=message, user_message_id=user_mid,
-            enable_aicg=aicg,
-            src=(f"chat-llm:{endpoint[2]}" if endpoint else "chat-local"),
-            fail_on_empty=bool(endpoint) and not fb,
-        )
-
-        def _save(ctx: ChatContext, display: str, tagged: str) -> int:
-            aid = int(db.record_chat_message(uid, ctx.session_id, "assistant",
-                                             tagged, clean_for_storage(tagged)) or 0)
-            if uid and cid and aid:
-                # 可观测层：先记本轮召回明细（含分项得分与注入深度）
-                Handler._record_recalls(uid, ctx.session_id, turn_id,
-                                        sent.get("prompt"))
-                # 后台线程跑记忆摘要（LLM 调用最长十几秒，不能卡住 SSE 收尾）
-                threading.Thread(target=self._maybe_summarize,
-                                 args=(uid, ctx.session_id, cid), daemon=True).start()
-                # 写入层：把本轮对话抽成结构化记忆
-                if (sent.get("prompt") or {}).get("config"):
-                    threading.Thread(
-                        target=Handler._write_memories,
-                        args=(uid, ctx.session_id, cid, turn_id, message, display),
-                        daemon=True).start()
-            return aid
-
-        def _ensure(ctx: ChatContext, msgs: list[dict], text: str) -> str:
-            base, key, model = endpoint
-            return self._ensure_format(base, key, model, msgs, text, uid, sid,
-                                       on_send=send_hook)
-
-        ports = ChatPorts(
-            load_context=_context,
-            build_messages=lambda ctx: _prepare(ctx, []),
-            stream_llm=lambda msgs: self._stream_pieces(
-                msgs, endpoint, fb, uid, rate, name, message, send_hook,
-                meta=llm_meta, should_stop=stop_event.is_set,
-                stream_key=_stream_key(uid, sid), cid=cid,
-                summarize=(lambda: self._maybe_summarize(
-                    uid, sid, cid,
-                    keep=Handler._compress_keep_rounds(uid, cid) * 2)
-                           if uid and cid else None),
-                rebuild=(lambda: _prepare(ctx_box["ctx"], []))),
-            on_stream_error=lambda exc, raw, req: self._decide_stream_error(
-                exc, raw, fb, name, message),
-            post_process=_post,
-            save_assistant=_save,
-            emit=self._emit_frame,
-            local_reply=lambda req: self._local_reply(name, message),
-            ensure_format=_ensure if endpoint else None,
-            cancelled=stop_event.is_set,
-        )
-        try:
-            turn = ChatRouter(ports).chat_stream(request)
-        except Exception as exc:                     # noqa: BLE001
-            # 生成链路异常：清掉本轮 user 消息，避免留下孤立消息导致下一轮连续两条 user
-            if user_mid:
-                try:
-                    db.delete_chat_message(uid, user_mid)
-                except Exception:                   # noqa: BLE001
-                    pass
-            self._sse_frame({"type": "error", "message": f"生成失败：{exc}"})
-            self._sse_frame({"type": "done", "assistantMessageId": 0,
-                             "userMessageId": 0})
-            self._sse_frame(None)
-            self._note = "chat-stream/error"
-            return True
-        finally:
-            _unregister_stream(uid, sid, stop_event)
-            # 本回合实际发出的全部请求（主对话 + 补格式 + 重试）汇总成一条快照
-            if send_hook and prompt_hits:
-                final_msgs = sent.get("messages") or []
-                try:
-                    db.record_chat_prompt(
-                        uid, sid, cid, endpoint[2], prompt_hits,
-                        turn_id=turn_id,
-                        finish_reason=str(llm_meta.get("finish_reason") or ""),
-                        sections=sectionize(final_msgs),
-                        prompt_hash=prompt_prefix_hash(final_msgs),
-                        worldbook=(sent.get("prompt") or {}).get("worldbook"),
-                        memory=Handler._memory_log(sent.get("prompt")),
-                        diff=self._prompt_diff(uid, sid, final_msgs))
-                except Exception as _e:
-                    print(f"[prompt-log] 写入失败：{_e}", file=sys.stderr)
-
-        src = "chat-stream-aborted" if turn.aborted else turn.src
-        try:
-            if not turn.ok:
-                # 开关关闭：不自动切本地 → 报错收尾，不落库、不扣费；
-                # 同时清掉本轮 user 消息，下一轮不会出现连续两条 user
-                if user_mid:
-                    try:
-                        db.delete_chat_message(uid, user_mid)
-                    except Exception:               # noqa: BLE001
-                        pass
-                self._sse_frame({"type": "error", "message": turn.error})
-                self._sse_frame({"type": "done", "assistantMessageId": 0,
-                                 "userMessageId": 0, "stopped": bool(turn.aborted)})
-                self._sse_frame(None)
-                self._note = f"chat-stream/{turn.src}"
-                return True
-            stopped = bool(turn.aborted)
-            # 状态面板落库：缺字段沿用上一轮（stats_json 是跨轮真相源）
-            if uid and turn.status:
-                try:
-                    db.update_thread_stats(uid, sid, status_dict(turn.status))
-                except Exception as _e:              # noqa: BLE001
-                    print(f"[status] 写回失败：{_e}", file=sys.stderr)
-            empty_stop = stopped and not turn.display_text.strip()
-            cg = ([] if empty_stop else
-                  self._match_cg(uid, cid, turn.display_text, sid))
-            if turn.has_image:
-                cg = []   # 正文里已经内嵌了 <image>，不再推 cg 条避免重复
-            if cg:
-                # url 补全成完整 URL（前端直接用，否则 /image/xxx 相对路径打不开）
-                host = self.headers.get("Host") or "127.0.0.1:4173"
-                for c in cg:
-                    u = c.get("url") or ""
-                    if u.startswith("/"):
-                        c["url"] = f"http://{host}{u}"
-                self._sse_frame({"type": "cg", "cg": cg})
-            # 正文里已经内嵌的图片：单独推 image_trigger，前端按 URL 去重后置顶
-            if turn.images:
-                host = self.headers.get("Host") or "127.0.0.1:4173"
-                for u in turn.images:
-                    if u.startswith("/"):
-                        u = f"http://{host}{u}"
-                    self._sse_frame({"type": "image_trigger", "url": u})
-            if empty_stop:
-                # 用户停止且没有产出：不落 assistant、不计费
-                charge = {"deducted": 0, "balance": 0, "cost": 0,
-                          "mode": "stopped", "tokens": 0, "extra": 0}
-            else:
-                charge = (db.charge_chat(uid, message, turn.display_text,
-                                         CG_IMAGE_POINTS if turn.has_image else 0)
-                          if uid else
-                          {"deducted": 0, "balance": 0, "cost": 0, "mode": "guest",
-                           "tokens": 0, "extra": 0})
-            if uid and not empty_stop:
-                db.log_consumption(uid, "chat", cid, name, charge["mode"],
-                                   charge["tokens"], charge["deducted"])
-            self._sse_frame({
-                "type": "usage",
-                "totalPointsDeducted": charge["deducted"],
-                "pointsConsumed": charge["deducted"],
-                "balance": charge["balance"],
-                "billingMode": charge["mode"],
-                "tokens": charge["tokens"],
-                "cost": charge["cost"],
-                "cgPoints": charge.get("extra", 0),
-                "upstreamUsage": llm_meta.get("usage") or {},
-            })
-            self._sse_frame({"type": "done",
-                             "assistantMessageId": turn.assistant_id,
-                             "userMessageId": user_mid,
-                             "displayText": turn.display_text,
-                             "status": turn.status,
-                             "statusValues": status_dict(turn.status),
-                             "options": turn.options,
-                             "finishReason": llm_meta.get("finish_reason", ""),
-                             "truncated": (str(llm_meta.get("finish_reason") or "")
-                                           == "length"),
-                             "upstreamUsage": llm_meta.get("usage") or {},
-                             "stopped": stopped})
-            self._sse_frame(None)               # data: [DONE]
-        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
-            self._note = "chat-stream/aborted"
-            src = "chat-stream-aborted"
-        if not self._note.startswith("chat-stream/aborted"):
-            self._note = f"chat-stream/{src}"
-        return True
-
-    def _local_chat_sync(self, payload: dict, uid: int | None) -> bool:
-        """非流式对话（输入栏切到「非流式」后走 chatSync，一次拿全）
-
-        与流式共用同一套准备/后处理：自定义设定与记忆注入、schema 钳制、
-        状态写回、记忆摘要、积分扣费都保持一致，只是不分帧下发。
-        """
-        sid = str(payload.get("sessionId") or "").strip()
-        message = str(payload.get("message") or payload.get("content") or "")
-        cid = str(payload.get("characterId") or payload.get("characterID") or "")
-        if not sid:
-            view = db.ensure_chat_session(
-                uid, cid, initial_stats=Handler._initial_stats(cid))
-            sid = view["sessionId"]
-        else:
-            view = db.ensure_chat_session(
-                uid, cid, session_id=sid, initial_stats=Handler._initial_stats(cid))
-        name = str(view.get("characterName") or "角色")
-        rate = self._rate_id(payload)
-        aicg = payload.get("enableAICG") if isinstance(payload.get("enableAICG"), bool) else None
-        # D3：会话还是空的 → 后端补写一次角色开场白（只写一次）
-        self._maybe_first_mes(uid, sid, cid)
-        # 先校验积分再落库（同流式），避免余额不足留下孤立 user 消息
-        if uid:
-            quote = db.chat_quote(uid, message)
-            if quote["cost"] > 0 and quote["balance"] < quote["cost"]:
-                return self._creative_fail(
-                    f"积分不足：本次需要 {quote['cost']} 积分，当前余额 {quote['balance']}。"
-                    "可在账号中心签到或联系管理员充值。", code=2)
-        user_mid = 0
-        if message.strip():
-            user_mid = int(db.record_chat_message(uid, sid, "user", message) or 0)
-        turn_id = uuid.uuid4().hex[:16]
-        endpoint = self._llm_endpoint(rate)
-        # Prompt 快照：同流式，挂在实际发包处，本回合汇总一条
-        prompt_hits: list[dict] = []
-        send_hook = prompt_hits.append if (endpoint and payload.get("promptLog")) else None
-        meta: dict = {}
-        sent: dict = {"messages": None}
-        try:
-            ctx = self._chat_context(uid, sid, cid, name, message, aicg)
-
-            def _prepare(c: ChatContext, msgs: list[dict]) -> list[dict]:
-                msgs, vmeta = self._prompt_messages(uid, sid, cid, c, rate)
-                sent["prompt"] = vmeta
-                self._inject_custom(msgs, payload, message)
-                if os.environ.get("MISSAI_DEBUG_PROMPT") == "1":
-                    print("[prompt]", json.dumps(msgs, ensure_ascii=False),
-                          file=sys.stderr, flush=True)
-                sent["messages"] = msgs
-                return msgs
-
-            messages = _prepare(ctx, [])
-            reply, src = self._ai_reply(
-                uid, sid, cid, name, message, rate, aicg,
-                on_send=send_hook, messages=messages, ctx=ctx, meta=meta)
-        except llm.LLMError as exc:
-            # 开关「超时回退」关闭：模型失败/超时不自动切本地 → 直接报错给前端
-            if user_mid:
-                try:
-                    db.delete_chat_message(uid, user_mid)
-                except Exception:                   # noqa: BLE001
-                    pass
-            return self._creative_fail(f"模型回复失败：{exc}")
-        except Exception as exc:                    # noqa: BLE001
-            if user_mid:
-                try:
-                    db.delete_chat_message(uid, user_mid)
-                except Exception:                   # noqa: BLE001
-                    pass
-            return self._creative_fail(f"生成失败：{exc}")
-        finally:
-            if send_hook and prompt_hits:
-                final_msgs = sent.get("messages") or []
-                try:
-                    db.record_chat_prompt(
-                        uid, sid, cid, endpoint[2] if endpoint else "", prompt_hits,
-                        turn_id=turn_id,
-                        finish_reason=str(meta.get("finish_reason") or ""),
-                        sections=sectionize(final_msgs),
-                        prompt_hash=prompt_prefix_hash(final_msgs),
-                        worldbook=(sent.get("prompt") or {}).get("worldbook"),
-                        memory=Handler._memory_log(sent.get("prompt")),
-                        diff=self._prompt_diff(uid, sid, final_msgs))
-                except Exception as _e:
-                    print(f"[prompt-log] 写入失败：{_e}", file=sys.stderr)
-        # 收尾拦截：与流式一致（含 schema 钳制，避免自定义属性行被误收）
-        cg_data = self._cg_payload(uid, cid, aicg)
-        out = process_output(reply, cg_data, enable_cg=bool(cg_data),
-                             current_user_msg=message, matcher=_match_cg,
-                             schema=self._clamp_schema(ctx))
-        reply_tagged = out["tagged_text"]
-        reply = out["display_text"]
-        inline_cg = out["has_image"]
-        aid = int(db.record_chat_message(uid, sid, "assistant", reply_tagged,
-                                         clean_for_storage(reply_tagged)) or 0)
-        # 状态面板落库：与流式一致，缺字段沿用上一轮
-        if uid and out["status"]:
-            try:
-                db.update_thread_stats(uid, sid, status_dict(out["status"]))
-            except Exception as _e:                  # noqa: BLE001
-                print(f"[status] 写回失败：{_e}", file=sys.stderr)
-        if uid and cid and aid:
-            Handler._record_recalls(uid, sid, turn_id, sent.get("prompt"))
-            threading.Thread(target=self._maybe_summarize,
-                             args=(uid, sid, cid), daemon=True).start()
-            if (sent.get("prompt") or {}).get("config"):
-                threading.Thread(
-                    target=Handler._write_memories,
-                    args=(uid, sid, cid, turn_id, message, reply),
-                    daemon=True).start()
-        cg_list = self._match_cg(uid, cid, reply, sid)
-        if inline_cg:
-            cg_list = []
-        charge = (db.charge_chat(uid, message, reply,
-                                 CG_IMAGE_POINTS if inline_cg else 0) if uid
-                  else {"deducted": 0, "balance": 0, "cost": 0, "mode": "guest",
-                        "tokens": 0, "extra": 0})
-        if uid:
-            db.log_consumption(uid, "chat", cid, name, charge["mode"],
-                               charge["tokens"], charge["deducted"])
-        return self._local_ok({
-            "assistantMessageId": aid,
-            "userMessageId": user_mid,
-            "message": reply,
-            "displayText": reply,
-            "status": out["status"],
-            "statusValues": status_dict(out["status"]),
-            "options": out["options"],
-            "cg": cg_list,
-            "pointsConsumed": charge["deducted"],
-            "cgPoints": charge.get("extra", 0),
-            "balance": charge["balance"],
-            "billingMode": charge["mode"],
-            "tokens": charge["tokens"],
-            "finishReason": meta.get("finish_reason", ""),
-            "truncated": str(meta.get("finish_reason") or "") == "length",
-            "upstreamUsage": meta.get("usage") or {},
-            "stoppedByUser": False,
-            "sessionId": sid,
-        }, f"chat-sync/{src}")
-
     def _local_chat(self, rel: str, params: dict, payload: dict,
                     uid: int | None) -> bool:
         if rel == "narratium/guestChat/chatStream":
-            return self._local_chat_stream(payload, uid, guest=True)
+            return ChatTurnRunner(self, payload, uid,
+                                  ChatTurnRunner.MODE_GUEST).run()
         if not rel.startswith("narratium/chatSession/"):
             return False
         sub = rel.split("/", 2)[2]
@@ -5092,7 +5008,8 @@ class Handler(BaseHTTPRequestHandler):
                                    "hasMore": False}, f"chat-{sub}")
 
         if sub == "chatSync":
-            return self._local_chat_sync(payload, uid)
+            return ChatTurnRunner(self, payload, uid,
+                                  ChatTurnRunner.MODE_SYNC).run()
 
         if sub == "resolve":
             sid = str(params.get("sessionId") or payload.get("sessionId") or "")
@@ -5164,7 +5081,8 @@ class Handler(BaseHTTPRequestHandler):
                                    "messages": [], "hasMore": False}, "chat-partial")
 
         if sub == "chatStream":
-            return self._local_chat_stream(payload, uid, guest=False)
+            return ChatTurnRunner(self, payload, uid,
+                                  ChatTurnRunner.MODE_STREAM).run()
 
         if sub == "chatStream/cancel" or sub == "stop":
             sid = str(payload.get("sessionId") or params.get("sessionId") or "")
@@ -5480,33 +5398,44 @@ class Handler(BaseHTTPRequestHandler):
         if rel.endswith("modelConfig/getByModelRate"):
             mid = str(params.get("modelRateId") or "0").strip() or "0"
             saved = db.get_config(f"modelConfig:{who}:{mid}") or {}
-            # 默认值与源站一致：温度 0.7 / TopP 0.8 / 惩罚 0 / 最长 8192
+            # 默认值与源站一致：温度 0.7 / TopP 0.8 / 惩罚 0 / 最长 8192。
+            # 存量脏值按同一套范围钳制，避免滑条位置与数字显示不一致。
             data = {"modelRateId": self._int(mid, 0),
                     "temperature": 0.7, "topP": 0.8, "presencePenalty": 0.0,
                     "frequencyPenalty": 0.0, "maxTokens": 8192,
                     "contextWindow": 8192}
-            data.update({k: v for k, v in (saved or {}).items() if k in data})
+            data.update(Handler._model_config_clean(saved)[0])
             return self._local_ok(data, "model-config-get")
 
         if rel.endswith("modelConfig/saveByModelRate"):
             mid = str(payload.get("modelRateId") or "0").strip() or "0"
-            keep = {k: payload.get(k) for k in
-                    ("temperature", "topP", "presencePenalty",
-                     "frequencyPenalty", "maxTokens", "contextWindow")
-                    if k in payload}
-            db.set_config(f"modelConfig:{who}:{mid}", keep)
-            return self._local_ok({"modelRateId": self._int(mid, 0), **keep},
+            keep, err = Handler._model_config_clean(payload, strict=True)
+            if err:
+                self._note = "model-config-save-bad"
+                self.send_json({"code": 400, "msg": err, "data": None})
+                return True
+            # 深合并：面板只提交这 6 个键，不能把同键下别处写入的配置（如 contextWindow
+            # 的旧值 / 未来新增字段）整包覆盖掉
+            cur = db.get_config(f"modelConfig:{who}:{mid}") or {}
+            cur = cur if isinstance(cur, dict) else {}
+            cur.update(keep)
+            db.set_config(f"modelConfig:{who}:{mid}", cur)
+            return self._local_ok({"modelRateId": self._int(mid, 0), **cur},
                                   "model-config-save")
 
         if rel.endswith("promptConfig/getByCharacter"):
             cid = str(params.get("characterID")
                       or params.get("characterId") or "").strip()
             saved = db.get_config(f"promptEngine:{who}:{cid}") or {}
-            data = {"characterID": cid,
+            data = {"characterId": cid,
                     "anchor": {"enabled": False, "depth": 2, "frequency": 4,
                                "text": ""},
                     "memory": self._memory_cfg(who, cid)}
-            data.update({k: v for k, v in (saved or {}).items() if k in data})
+            # 压缩保留轮数按「角色级 → db 键 → 常量」解析成实际生效值
+            data["memory"]["compressKeepRounds"] = Handler._compress_keep_rounds(who, cid)
+            # memory 已是「默认值 + 迁移后的存量配置」，不能再被原始存量覆盖
+            data.update({k: v for k, v in (saved or {}).items()
+                         if k in data and k != "memory"})
             return self._local_ok(data, "prompt-config-get")
 
         if rel.endswith("promptConfig/saveByCharacter"):
@@ -5517,10 +5446,44 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(payload.get("anchor"), dict):
                 cur["anchor"] = payload["anchor"]
             if isinstance(payload.get("memory"), dict):
-                cur["memory"] = {**(cur.get("memory") or {}),
-                                 **payload["memory"]}
+                inc = payload["memory"]
+                old = cur.get("memory") if isinstance(cur.get("memory"), dict) else {}
+                merged = {**old, **inc}
+                if isinstance(inc.get("recall"), dict):
+                    old_recall = (old.get("recall")
+                                  if isinstance(old.get("recall"), dict) else {})
+                    r = {**old_recall, **inc["recall"]}
+                    # 打上新版本标记：之后不再走旧默认值迁移，用户改的值才生效
+                    r["version"] = Handler.MEMORY_DEFAULTS["recall"]["version"]
+                    for k, lo, hi in (("topK", 1, 20), ("waitMs", 1000, 15000)):
+                        if k not in inc["recall"]:
+                            continue
+                        try:
+                            r[k] = max(lo, min(hi, int(inc["recall"][k])))
+                        except (TypeError, ValueError):
+                            if k in old_recall:
+                                r[k] = old_recall[k]
+                            else:
+                                r.pop(k, None)
+                    merged["recall"] = r
+                elif isinstance(old.get("recall"), dict):
+                    merged["recall"] = old["recall"]
+                # 记忆面板写入的数值统一钳制，保证前后端显示一致
+                for k, lo, hi in (("compressKeepRounds", 1, 24),
+                                  ("injectDepth", 0, 10),
+                                  ("maxTokens", 200, 2000)):
+                    if k not in inc:
+                        continue
+                    try:
+                        merged[k] = max(lo, min(hi, int(inc[k])))
+                    except (TypeError, ValueError):
+                        if k in old:
+                            merged[k] = old[k]
+                        else:
+                            merged.pop(k, None)
+                cur["memory"] = merged
             db.set_config(key, cur)
-            return self._local_ok({"characterID": cid, **cur},
+            return self._local_ok({"characterId": cid, **cur},
                                   "prompt-config-save")
 
         if rel.endswith("embeddingConfig/get"):
@@ -5538,30 +5501,28 @@ class Handler(BaseHTTPRequestHandler):
                                   "embedding-config-save")
 
         if rel.endswith("embeddingConfig/backfill"):
-            cid = str(payload.get("characterID") or params.get("characterID")
+            cid = str(payload.get("characterId") or payload.get("characterID")
+                      or params.get("characterId") or params.get("characterID")
                       or "").strip()
             sid2 = str(payload.get("sessionId") or params.get("sessionId")
                        or "").strip()
             threading.Thread(target=Handler._backfill_embeddings,
                              args=(who, cid, sid2), daemon=True).start()
-            return self._local_ok({"started": True, "characterID": cid,
+            return self._local_ok({"started": True, "characterId": cid,
                                    "sessionId": sid2}, "embedding-backfill")
 
         if rel.endswith("summaryConfig/getByCharacter"):
-            cid = str(params.get("characterID") or "").strip()
+            cid = str(params.get("characterId") or params.get("characterID") or "").strip()
             saved = db.get_config(f"summaryConfig:{who}:{cid}") or {}
-            data = {"characterID": cid, "summaryEnabled": True,
-                    "summaryInjectMode": "inline", "summaryReserveRounds": 3}
+            data = {"characterId": cid, "summaryEnabled": True}
             data.update({k: v for k, v in (saved or {}).items() if k in data})
             return self._local_ok(data, "summary-config-get")
 
         if rel.endswith("summaryConfig/saveByCharacter"):
-            cid = str(payload.get("characterID") or "").strip()
-            keep = {k: payload.get(k) for k in
-                    ("summaryEnabled", "summaryInjectMode",
-                     "summaryReserveRounds") if k in payload}
+            cid = str(payload.get("characterId") or payload.get("characterID") or "").strip()
+            keep = {k: payload.get(k) for k in ("summaryEnabled",) if k in payload}
             db.set_config(f"summaryConfig:{who}:{cid}", keep)
-            return self._local_ok({"characterID": cid, **keep},
+            return self._local_ok({"characterId": cid, **keep},
                                   "summary-config-save")
 
         return False
@@ -6131,12 +6092,39 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"code": 0, "msg": "ok", "data": {
                 "models": db.llm_rate_models()}})
             return True
+        if path == "/api/chat/memory-status" and self.command in ("GET", "HEAD"):
+            self._note = "chat-memory-status"
+            sess = self.current_session() or {}
+            uid = sess.get("id")
+            qs = parse_qs(query)
+            cid = (qs.get("characterId") or qs.get("characterID") or [""])[0]
+            sid = (qs.get("sessionId") or [""])[0]
+            st = (_RECALL_STATS.get((int(uid), str(sid), str(cid)))
+                  if uid else None)
+            data = dict(st or {})
+            data["available"] = bool(st)
+            self.send_json({"code": 0, "msg": "ok", "data": data})
+            return True
+        if path == "/api/chat/model-params-status" and self.command in ("GET", "HEAD"):
+            self._note = "chat-model-params-status"
+            sess = self.current_session() or {}
+            uid = sess.get("id")
+            qs = parse_qs(query)
+            mid = str((qs.get("modelRateId") or ["0"])[0] or "0").strip() or "0"
+            sid = (qs.get("sessionId") or [""])[0]
+            rec = (_LAST_MODEL_PARAMS.get((int(uid), str(sid), mid))
+                   if uid else None)
+            data = dict(rec or {})
+            data["available"] = bool(rec)
+            self.send_json({"code": 0, "msg": "ok", "data": data})
+            return True
         if path == "/api/chat/memories" and self.command in ("GET", "HEAD"):
             self._note = "chat-memories"
             sess = self.current_session() or {}
             uid = sess.get("id")
-            cid = (parse_qs(query).get("characterId") or [""])[0]
-            items = db.chat_memories(uid, cid) if uid and cid else []
+            cid = (parse_qs(query).get("characterId")
+                   or parse_qs(query).get("characterID") or [""])[0]
+            items = db.list_chat_memories(uid, cid) if uid and cid else []
             self.send_json({"code": 0, "msg": "ok",
                             "data": {"memories": items}})
             return True
@@ -6145,7 +6133,7 @@ class Handler(BaseHTTPRequestHandler):
             sess = self.current_session() or {}
             uid = sess.get("id")
             mid = int((parse_qs(query).get("id") or ["0"])[0] or 0)
-            n = db.delete_chat_memory(uid, mid) if uid and mid else 0
+            n = db.delete_chat_memory_item(uid, mid) if uid and mid else 0
             self.send_json({"code": 0, "msg": "ok", "data": {"deleted": n}})
             return True
         return False
@@ -6433,6 +6421,471 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch()
 
 
+class ChatTurnRunner:
+    """一次对话回合的唯一执行器（流式 / 非流式 / 试玩共用）。
+
+    链路只有一条：prepare → build prompt → provider 流式原语 → 后处理 → 落库/计费。
+    三种出口只是「输出适配器」不同，执行与后处理完全同一条：
+      · stream：边收边推 SSE，收尾补 usage / done
+      · sync  ：同一条流只累积文本，读完一次性回 JSON
+      · guest ：同一条流只累积文本，关掉记忆/状态/计费，按试玩协议回单帧
+    """
+
+    MODE_STREAM = "stream"
+    MODE_SYNC = "sync"
+    MODE_GUEST = "guest"
+
+    def __init__(self, handler, payload: dict, uid: int | None, mode: str):
+        self.h = handler
+        self.payload = payload if isinstance(payload, dict) else {}
+        self.uid = uid
+        self.mode = mode
+        self.guest = mode == self.MODE_GUEST
+        self.sid = ""
+        self.cid = ""
+        self.name = "角色"
+        self.message = ""
+        self.rate = None
+        self.aicg: bool | None = None
+        self.turn_id = ""
+        self.endpoint = None
+        self.fb = False
+        self.meta: dict = {}
+        self.sent: dict = {"messages": None}
+        self.ctx_box: dict = {}
+        self.prompt_hits: list[dict] = []
+        self.send_hook = None
+        self.user_mid = 0
+        self.stop_event: threading.Event | None = None
+
+    # ------------------------------------------------------------ 入口
+    def run(self) -> bool:
+        self._setup()
+        if not self._check_quota():
+            return True
+        self._record_user()
+        self._prefetch_recall()
+        self.turn_id = uuid.uuid4().hex[:16]
+        self.stop_event = _register_stream(self.uid, self.sid)
+        self.endpoint = Handler._llm_endpoint(self.rate)
+        self.fb = Handler._timeout_local_fallback()
+        if (not self.guest and self.endpoint
+                and self.payload.get("promptLog")):
+            self.send_hook = self.prompt_hits.append
+        try:
+            if self.mode == self.MODE_STREAM:
+                return self._run_stream()
+            return self._run_collect()
+        finally:
+            _unregister_stream(self.uid, self.sid, self.stop_event)
+            self._write_prompt_log()
+
+    # ------------------------------------------------------------ 准备
+    def _setup(self) -> None:
+        p = self.payload
+        self.sid = str(p.get("sessionId") or "").strip()
+        self.message = str(p.get("message") or p.get("content") or "")
+        self.cid = str(p.get("characterId") or p.get("characterID") or "")
+        if not self.sid:
+            view = db.ensure_chat_session(
+                self.uid, self.cid, initial_stats=Handler._initial_stats(self.cid))
+            self.sid = view["sessionId"]
+        else:
+            view = db.ensure_chat_session(
+                self.uid, self.cid, session_id=self.sid,
+                initial_stats=Handler._initial_stats(self.cid))
+        self.name = str(view.get("characterName") or "角色")
+        self.rate = Handler._rate_id(p)
+        aicg = p.get("enableAICG")
+        self.aicg = aicg if isinstance(aicg, bool) else None
+        # D3：会话还是空的 → 后端补写一次角色开场白（只写一次）
+        if not self.guest:
+            Handler._maybe_first_mes(self.uid, self.sid, self.cid)
+
+    def _check_quota(self) -> bool:
+        """先校验积分再落库：余额不足时不能留下孤立 user 消息。"""
+        if self.guest or not self.uid:
+            return True
+        quote = db.chat_quote(self.uid, self.message)
+        if quote["cost"] <= 0 or quote["balance"] >= quote["cost"]:
+            return True
+        msg = (f"积分不足：本次需要 {quote['cost']} 积分，当前余额 "
+               f"{quote['balance']}。可在账号中心签到或联系管理员充值。")
+        if self.mode == self.MODE_STREAM:
+            self.h._sse_start("chat-stream/insufficient-points")
+            self.h._sse_frame({"type": "error", "message": msg})
+            self.h._sse_frame({"type": "done", "assistantMessageId": 0,
+                               "userMessageId": 0})
+            self.h._sse_frame(None)
+        else:
+            self.h._creative_fail(msg, code=2)
+        return False
+
+    def _record_user(self) -> None:
+        if not self.message.strip():
+            return
+        self.user_mid = int(db.record_chat_message(
+            self.uid, self.sid, "user", self.message) or 0)
+
+    def _prefetch_recall(self) -> None:
+        """召回预取前移：与历史加载 / 上下文准备并行。"""
+        if self.guest or not self.uid or not self.message.strip():
+            return
+        try:
+            q_early, segs = Handler._recall_query_early(
+                self.uid, self.sid, self.message)
+            Handler._recall_prefetch(self.uid, self.sid, self.cid, q_early, segs)
+        except Exception as exc:                     # noqa: BLE001
+            print(f"[recall] 入口预取失败：{exc}", file=sys.stderr)
+
+    # ------------------------------------------------------------ Prompt
+    def _context(self, req: ChatRequest) -> ChatContext:
+        return Handler._chat_context(self.uid, req.session_id, req.character_id,
+                                     req.character_name, req.user_input,
+                                     req.enable_aicg)
+
+    def _prepare(self, ctx: ChatContext, _msgs: list[dict]) -> list[dict]:
+        """整段重建：世界书/角色卡/记忆 + 输入栏自定 + 发送前预算裁剪。"""
+        self.ctx_box["ctx"] = ctx
+        msgs, meta = Handler._prompt_messages(
+            self.uid, self.sid, self.cid, ctx, self.rate)
+        self.sent["prompt"] = meta
+        Handler._inject_custom(msgs, self.payload, self.message)
+        # 发送前预判：先给输出预算留出空间，输入超了就确定性裁剪（无网络、无延迟）。
+        # _output_budget 已保证 target ≥ 输入保底（窗口 1/4，最低 512），
+        # 所以这里不再出现「maxTokens 调大 → target ≤ 0 → 跳过裁剪」的反直觉分支。
+        try:
+            window = int(Handler._prompt_config(self.uid, self.cid, self.rate)
+                         .get("contextWindow") or 8192)
+            target = window - Handler._output_budget(self.uid, self.rate) - 64
+            before = estimate_messages(msgs)
+            if before > target:
+                keep_rounds = Handler._compress_keep_rounds(self.uid, self.cid)
+                msgs, dropped = compress_for_budget(msgs, target, keep_rounds)
+                after = estimate_messages(msgs)
+                Handler._log_compression(
+                    "pre", self.uid, self.sid, self.cid, before, after,
+                    f"-{dropped}条历史", f"keep={keep_rounds}轮")
+                if dropped:
+                    # 被裁掉的历史进后台压缩，下一轮以摘要/记忆槽生效
+                    Handler._enqueue_compress(self.uid, self.sid, self.cid)
+        except Exception as exc:                     # noqa: BLE001  裁剪失败不影响本轮
+            print(f"[compress] 发送前裁剪失败：{exc}", file=sys.stderr)
+        if os.environ.get("MISSAI_DEBUG_PROMPT") == "1":
+            print("[prompt]", json.dumps(msgs, ensure_ascii=False),
+                  file=sys.stderr, flush=True)
+        self.sent["messages"] = msgs
+        return msgs
+
+    def _post(self, text: str, ctx: ChatContext) -> dict:
+        # 收尾拦截：模型点的 <image>ID</image> 换真实地址；没点图则按权重兜底
+        cg_data = Handler._cg_payload(self.uid, self.cid, ctx.enable_aicg)
+        return process_output(text, cg_data, enable_cg=bool(cg_data),
+                              current_user_msg=self.message, matcher=_match_cg,
+                              schema=Handler._clamp_schema(ctx))
+
+    # ------------------------------------------------------------ 落库 / 模型
+    def _save(self, ctx: ChatContext, display: str, tagged: str) -> int:
+        aid = int(db.record_chat_message(self.uid, ctx.session_id, "assistant",
+                                         tagged, clean_for_storage(tagged)) or 0)
+        # 试玩只落消息本身：不写记忆、不推进摘要、不记召回
+        if self.guest or not (self.uid and self.cid and aid):
+            return aid
+        Handler._record_recalls(self.uid, ctx.session_id, self.turn_id,
+                                self.sent.get("prompt"))
+        # 后台线程跑记忆摘要（LLM 调用最长十几秒，不能卡住收尾）
+        threading.Thread(target=Handler._maybe_summarize,
+                         args=(self.uid, ctx.session_id, self.cid),
+                         daemon=True).start()
+        if (self.sent.get("prompt") or {}).get("config"):
+            threading.Thread(
+                target=Handler._write_memories,
+                args=(self.uid, ctx.session_id, self.cid, self.turn_id,
+                      self.message, display),
+                daemon=True).start()
+        return aid
+
+    def _ensure(self, ctx: ChatContext, msgs: list[dict], text: str) -> str:
+        base, key, model = self.endpoint
+        return self.h._ensure_format(base, key, model, msgs, text,
+                                     self.uid, self.sid, on_send=self.send_hook)
+
+    def _stream_llm(self, msgs: list[dict]):
+        """provider 流式原语：唯一的下行实现（sync 也消费这条流）。"""
+        return self.h._stream_pieces(
+            msgs, self.endpoint, self.fb, self.uid, self.rate,
+            self.name, self.message, self.send_hook,
+            meta=self.meta, should_stop=self.stop_event.is_set,
+            stream_key=_stream_key(self.uid, self.sid), cid=self.cid,
+            summarize=(lambda: Handler._maybe_summarize(
+                self.uid, self.sid, self.cid,
+                keep=Handler._compress_keep_rounds(self.uid, self.cid) * 2)
+                       if self.uid and self.cid else None),
+            rebuild=(lambda: self._prepare(self.ctx_box["ctx"], [])))
+
+    def _on_stream_error(self, exc: Exception, raw: str,
+                         req: ChatRequest) -> StreamDecision:
+        if self.guest:
+            # 试玩端没有 error 正文协议：失败也当一条回复发出去
+            if self.fb and not raw:
+                return StreamDecision(
+                    src="chat-llm-failed",
+                    text=Handler._local_reply(self.name, self.message))
+            return StreamDecision(src="chat-llm-failed",
+                                  text=f"模型回复失败：{exc}")
+        return Handler._decide_stream_error(exc, raw, self.fb,
+                                            self.name, self.message)
+
+    def _ports(self) -> ChatPorts:
+        return ChatPorts(
+            load_context=self._context,
+            build_messages=lambda ctx: self._prepare(ctx, []),
+            stream_llm=self._stream_llm,
+            on_stream_error=self._on_stream_error,
+            post_process=self._post,
+            save_assistant=self._save,
+            emit=(self.h._emit_frame if self.mode == self.MODE_STREAM
+                  else (lambda frame: True)),
+            local_reply=lambda req: Handler._local_reply(self.name, self.message),
+            ensure_format=(self._ensure if self.endpoint else None),
+            cancelled=self.stop_event.is_set,
+        )
+
+    def _request(self) -> ChatRequest:
+        return ChatRequest(
+            session_id=self.sid, character_id=self.cid, character_name=self.name,
+            user_input=self.message, user_message_id=self.user_mid,
+            enable_aicg=self.aicg,
+            src=(f"chat-llm:{self.endpoint[2]}" if self.endpoint else "chat-local"),
+            fail_on_empty=(bool(self.endpoint) and not self.fb
+                           and not self.guest),
+        )
+
+    def _delete_user(self) -> None:
+        if not self.user_mid:
+            return
+        try:
+            db.delete_chat_message(self.uid, self.user_mid)
+        except Exception:                            # noqa: BLE001
+            pass
+
+    def _persist_status(self, status) -> None:
+        if self.guest or not self.uid or not status:
+            return
+        try:
+            db.update_thread_stats(self.uid, self.sid, status_dict(status))
+        except Exception as _e:                      # noqa: BLE001
+            print(f"[status] 写回失败：{_e}", file=sys.stderr)
+
+    def _write_prompt_log(self) -> None:
+        if not (self.send_hook and self.prompt_hits):
+            return
+        final_msgs = self.sent.get("messages") or []
+        try:
+            db.record_chat_prompt(
+                self.uid, self.sid, self.cid,
+                self.endpoint[2] if self.endpoint else "",
+                self.prompt_hits,
+                turn_id=self.turn_id,
+                finish_reason=str(self.meta.get("finish_reason") or ""),
+                sections=sectionize(final_msgs),
+                prompt_hash=prompt_prefix_hash(final_msgs),
+                worldbook=(self.sent.get("prompt") or {}).get("worldbook"),
+                memory=Handler._memory_log(self.sent.get("prompt")),
+                diff=Handler._prompt_diff(self.uid, self.sid, final_msgs))
+        except Exception as _e:                      # noqa: BLE001
+            print(f"[prompt-log] 写入失败：{_e}", file=sys.stderr)
+
+    # ------------------------------------------------------------ 出口：流式
+    def _run_stream(self) -> bool:
+        h = self.h
+        h._sse_start("chat-stream/self")
+        try:
+            turn = ChatRouter(self._ports()).chat_stream(self._request())
+        except Exception as exc:                     # noqa: BLE001
+            # 生成链路异常：清掉本轮 user 消息，避免下一轮连续两条 user
+            self._delete_user()
+            h._sse_frame({"type": "error", "message": f"生成失败：{exc}"})
+            h._sse_frame({"type": "done", "assistantMessageId": 0,
+                          "userMessageId": 0})
+            h._sse_frame(None)
+            h._note = "chat-stream/error"
+            return True
+
+        src = "chat-stream-aborted" if turn.aborted else turn.src
+        try:
+            if not turn.ok:
+                # 开关关闭：不切本地 → 报错收尾，不落库、不扣费
+                self._delete_user()
+                h._sse_frame({"type": "error", "message": turn.error})
+                h._sse_frame({"type": "done", "assistantMessageId": 0,
+                              "userMessageId": 0,
+                              "stopped": bool(turn.aborted)})
+                h._sse_frame(None)
+                h._note = f"chat-stream/{turn.src}"
+                return True
+
+            stopped = bool(turn.aborted)
+            self._persist_status(turn.status)
+            empty_stop = stopped and not turn.display_text.strip()
+            if empty_stop:
+                # 空取消：assistant 没落库，user 也不能留成孤立消息
+                self._delete_user()
+            cg = ([] if empty_stop else
+                  Handler._match_cg(self.uid, self.cid, turn.display_text,
+                                    self.sid))
+            if turn.has_image:
+                cg = []          # 正文已内嵌 <image>，不再推 cg 条避免重复
+            if cg:
+                host = h.headers.get("Host") or "127.0.0.1:4173"
+                for c in cg:
+                    u = c.get("url") or ""
+                    if u.startswith("/"):
+                        c["url"] = f"http://{host}{u}"
+                h._sse_frame({"type": "cg", "cg": cg})
+            if turn.images:
+                host = h.headers.get("Host") or "127.0.0.1:4173"
+                for u in turn.images:
+                    if u.startswith("/"):
+                        u = f"http://{host}{u}"
+                    h._sse_frame({"type": "image_trigger", "url": u})
+
+            if empty_stop:
+                # 用户停止且没有产出：不落 assistant、不计费
+                charge = {"deducted": 0, "balance": 0, "cost": 0,
+                          "mode": "stopped", "tokens": 0, "extra": 0}
+            else:
+                charge = (db.charge_chat(self.uid, self.message,
+                                         turn.display_text,
+                                         CG_IMAGE_POINTS if turn.has_image else 0)
+                          if self.uid else
+                          {"deducted": 0, "balance": 0, "cost": 0,
+                           "mode": "guest", "tokens": 0, "extra": 0})
+            if self.uid and not empty_stop:
+                db.log_consumption(self.uid, "chat", self.cid, self.name,
+                                   charge["mode"], charge["tokens"],
+                                   charge["deducted"])
+            h._sse_frame({
+                "type": "usage",
+                "totalPointsDeducted": charge["deducted"],
+                "pointsConsumed": charge["deducted"],
+                "balance": charge["balance"],
+                "billingMode": charge["mode"],
+                "tokens": charge["tokens"],
+                "cost": charge["cost"],
+                "cgPoints": charge.get("extra", 0),
+                "upstreamUsage": self.meta.get("usage") or {},
+            })
+            h._sse_frame({
+                "type": "done",
+                "assistantMessageId": turn.assistant_id,
+                "userMessageId": self.user_mid,
+                "displayText": turn.display_text,
+                "status": turn.status,
+                "statusValues": status_dict(turn.status),
+                "options": turn.options,
+                "finishReason": self.meta.get("finish_reason", ""),
+                "truncated": (str(self.meta.get("finish_reason") or "")
+                              == "length"),
+                "upstreamUsage": self.meta.get("usage") or {},
+                "stopped": stopped,
+            })
+            h._sse_frame(None)               # data: [DONE]
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            h._note = "chat-stream/aborted"
+            src = "chat-stream-aborted"
+        if not h._note.startswith("chat-stream/aborted"):
+            h._note = f"chat-stream/{src}"
+        return True
+
+    # -------------------------------------------------- 出口：sync / guest
+    def _run_collect(self) -> bool:
+        """非流式 / 试玩：消费同一条流，读完再按各自协议回包。"""
+        h = self.h
+        try:
+            turn = ChatRouter(self._ports()).chat_stream(self._request())
+        except Exception as exc:                     # noqa: BLE001
+            self._delete_user()
+            if self.guest:
+                self._guest_error(f"生成失败：{exc}")
+                return True
+            return h._creative_fail(f"生成失败：{exc}")
+
+        if not turn.ok:
+            self._delete_user()
+            if self.guest:
+                self._guest_error(turn.error)
+                return True
+            return h._creative_fail(turn.error)
+
+        stopped = bool(turn.aborted)
+        src = "chat-stream-aborted" if stopped else turn.src
+        self._persist_status(turn.status)
+        empty_stop = stopped and not turn.display_text.strip()
+        if empty_stop:
+            # 空取消：assistant 没落库，user 也不能留成孤立消息
+            self._delete_user()
+        cg = ([] if empty_stop else
+              Handler._match_cg(self.uid, self.cid, turn.display_text, self.sid))
+        if turn.has_image:
+            cg = []
+
+        if self.guest:
+            h._sse_start(f"guest-chat/{src}")
+            h._sse_frame({"type": "message", "content": turn.display_text})
+            h._sse_frame({"type": "guest_info_updated", "maxChats": 20,
+                          "remainingChats": 19, "totalChats": 20})
+            h._sse_frame({"type": "done",
+                          "assistantMessageId": turn.assistant_id,
+                          "userMessageId": self.user_mid,
+                          "finishReason": self.meta.get("finish_reason", ""),
+                          "truncated": (str(self.meta.get("finish_reason") or "")
+                                        == "length")})
+            h._sse_frame(None)
+            return True
+
+        if empty_stop:
+            charge = {"deducted": 0, "balance": 0, "cost": 0,
+                      "mode": "stopped", "tokens": 0, "extra": 0}
+        else:
+            charge = (db.charge_chat(self.uid, self.message, turn.display_text,
+                                     CG_IMAGE_POINTS if turn.has_image else 0)
+                      if self.uid else
+                      {"deducted": 0, "balance": 0, "cost": 0, "mode": "guest",
+                       "tokens": 0, "extra": 0})
+        if self.uid and not empty_stop:
+            db.log_consumption(self.uid, "chat", self.cid, self.name,
+                               charge["mode"], charge["tokens"],
+                               charge["deducted"])
+        return h._local_ok({
+            "assistantMessageId": turn.assistant_id,
+            "userMessageId": self.user_mid,
+            "message": turn.display_text,
+            "displayText": turn.display_text,
+            "status": turn.status,
+            "statusValues": status_dict(turn.status),
+            "options": turn.options,
+            "cg": cg,
+            "pointsConsumed": charge["deducted"],
+            "cgPoints": charge.get("extra", 0),
+            "balance": charge["balance"],
+            "billingMode": charge["mode"],
+            "tokens": charge["tokens"],
+            "finishReason": self.meta.get("finish_reason", ""),
+            "truncated": str(self.meta.get("finish_reason") or "") == "length",
+            "upstreamUsage": self.meta.get("usage") or {},
+            "stoppedByUser": stopped,
+            "sessionId": self.sid,
+        }, f"chat-sync/{src}")
+
+    def _guest_error(self, msg: str) -> None:
+        self.h._sse_start("guest-chat/error")
+        self.h._sse_frame({"type": "error", "message": msg})
+        self.h._sse_frame({"type": "done", "assistantMessageId": 0,
+                           "userMessageId": 0})
+        self.h._sse_frame(None)
+
+
 class _Server(ThreadingHTTPServer):
     """刷新页面时浏览器会同时开几十条连接 —— 默认 listen 队列只有 5，
     挤不进去的直接 ConnectionRefused（页面上表现为某个请求 failed）。"""
@@ -6498,6 +6951,9 @@ def _seed_stat_rules() -> None:
 def main() -> None:
     db.init()
     imagedb.init()
+    # 记忆召回模型预热：后台线程，不阻塞首个请求
+    threading.Thread(target=memory_recall.warmup, kwargs={"wait": 0.0},
+                     name="memory-recall-warmup", daemon=True).start()
     admin = db.ensure_admin()
     _seed_stat_rules()
     imagedb.register_dir()            # html/image/ 里已有的图片先登记进图片库

@@ -19,7 +19,7 @@
   const EP = '/api/gva/narratiumWorldbookEntry/';
 
   function cidOf(w) {
-    return T.str(T.pick(w, ['characterID', 'characterId', 'ID', 'id', 'workID']));
+    return T.str(T.pick(w, ['characterId', 'ID', 'id', 'workID']));
   }
   function entryId(e) {
     if (!e) return '';
@@ -78,7 +78,7 @@
     const custom = state.kind === 'custom';
     const path = EP + (custom ? 'getUserCustomEntries' : 'getEntriesByCharacterID');
     $('wb-list').innerHTML = '<div class="loading-line">加载中…</div>';
-    A.get(path, { characterID: state.cid })
+    A.get(path, { characterId: state.cid })
       .then((data) => {
         state.entries = Array.isArray(data) ? data : T.asList(data, ['list', 'records']);
         renderList();
@@ -169,7 +169,7 @@
 
   function collect() {
     return {
-      characterID: state.cid,
+      characterId: state.cid,
       comment: ($('e-comment').value || '').trim(),
       keys: ($('e-keys').value || '').split(/[,，]/).map((s) => s.trim()).filter(Boolean),
       content: ($('e-content').value || '').trim(),
@@ -300,7 +300,7 @@
 
   function loadRules() {
     ruleState.cid = state.cid || '';
-    A.get(RULE_EP, { character_id: ruleState.cid })
+    A.get(RULE_EP, { characterId: ruleState.cid })
       .then((data) => {
         ruleState.sel = '';
         applyRuleData(data);
@@ -350,7 +350,7 @@
     if (!state.cid) { U.toast('请先选择作品', false); return; }
     const apply = () => {
       A.post(RULE_EP + 'setStatRuleScope',
-        { character_id: state.cid, scope })
+        { characterId: state.cid, scope })
         .then((data) => {
           applyRuleData(data);
           renderRuleTabs();
@@ -441,7 +441,7 @@
     btn.disabled = true;
     A.post(RULE_EP + 'saveStatMeta', {
       stat, initial_value: iv, min_value: lo, max_value: hi,
-      character_id: state.cid,
+      characterId: state.cid,
     }).then((data) => {
       applyRuleData(data);
       renderRuleTabs();
@@ -513,7 +513,7 @@
     if (!stat || !rows.length) { U.toast('请先选择要导出的数值规则', false); return; }
     const payload = {
       stat,
-      character_id: ruleState.scope === 'custom' ? state.cid : 'global',
+      characterId: ruleState.scope === 'custom' ? state.cid : 'global',
       initial_value: (ruleState.meta[stat] || {}).initial_value,
       min_value: (ruleState.meta[stat] || {}).min_value,
       max_value: (ruleState.meta[stat] || {}).max_value,
@@ -591,7 +591,7 @@
       emotion: read('rule-emotion'),
       behavior: read('rule-behavior'),
       keywords: read('rule-kw').split(/[,，、]/).map((s) => s.trim()).filter(Boolean),
-      character_id: state.cid,
+      characterId: state.cid,
     };
     if (mode === 'edit' && oldRow) {
       body.oldStat = oldStat;
@@ -623,7 +623,7 @@
     if (!stat || !range) { U.toast('请先选择一档规则', false); return; }
     U.confirmDialog('删除数值规则', '确认删除「' + stat + ' ' + range + '」这一档？', () => {
       A.post(RULE_EP + 'deleteStatRule',
-        { stat, range, character_id: state.cid })
+        { stat, range, characterId: state.cid })
         .then((data) => {
           ruleState.sel = '';
           applyRuleData(data);
