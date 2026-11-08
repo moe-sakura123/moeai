@@ -9,10 +9,12 @@
   const esc = U.esc;
   const G = '/api/local/gallery';
 
-  const DEFAULT_SIZES = ['1024x1024', '1024x1536', '1536x1024', '512x512'];
+  // 尺寸不再本地硬编码：比例 / 档位 / 精确像素全部由 /gallery/models 的
+  // sizeOptions（数据库 image_sizes 表）驱动。
   const FALLBACK_MODEL = {
     ID: 2, modelId: 'local-placeholder', modelName: '本地占位绘图',
-    providerName: '本地', providerKind: 'local', sizes: DEFAULT_SIZES, isDefault: true,
+    providerName: '本地', providerKind: 'local', isDefault: true,
+    capabilities: { ratio: true, tier: true, n: true, seed: true, negative: false },
   };
   const BUILDER = [
     { key: '画质', items: ['杰作', '超清', '8K', '细节丰富'] },
@@ -25,6 +27,8 @@
 
   const state = {
     models: [],
+    sizeOptions: [],
+    charge: { pointsPerImage: 0, freeLocal: true },
     templates: [],
     videoModels: [],
     videoProviders: [],
@@ -91,7 +95,9 @@
         '<small>' + esc(desc) + '</small></span>' +
         '<span class="badge' + (local ? ' ok' : '') + '">' + (local ? '免费' : '积分') + '</span></button>';
     }).join('');
-    syncSizes();
+    syncSizeControls();
+    applyCapabilities();
+    updatePoints();
     const hint = $('model-hint');
     if (hint) {
       hint.textContent = state.providers
@@ -100,18 +106,214 @@
     }
   }
 
-  function syncSizes() {
-    const sel = $('size');
-    if (!sel) return;
+  // ------------------------------------------------ 尺寸（数据库驱动）
+  const CUSTOM_RATIO = 'custom';
+  const CUSTOM_MIN = 64, CUSTOM_MAX = 8192, CUSTOM_MAX_PIXELS = 20000000;
+
+  function enabledSizes() {
+    return (state.sizeOptions || []).filter((o) => o && o.enabled);
+  }
+
+  function isCustomSize() {
+    const el = $('ratio');
+    return !!el && el.value === CUSTOM_RATIO;
+  }
+
+  // 读取自定义宽高并校验：整数、64–8192 px、总量 ≤2000 万像素
+  function customSize() {
+    const wEl = $('width'), hEl = $('height');
+    if (!wEl || !hEl) return { error: '自定义宽高输入框未就绪' };
+    const w = Number(wEl.value), h = Number(hEl.value);
+    const notInt = (v) => !Number.isFinite(v) || Math.floor(v) !== v;
+    if (notInt(w) || notInt(h)) return { error: '宽度和高度必须是整数 px' };
+    if (w < CUSTOM_MIN || w > CUSTOM_MAX || h < CUSTOM_MIN || h > CUSTOM_MAX) {
+      return { error: '宽高需在 ' + CUSTOM_MIN + '–' + CUSTOM_MAX + ' px 之间（当前 ' + w + '×' + h + '）' };
+    }
+    if (w * h > CUSTOM_MAX_PIXELS) {
+      return { error: '像素总量过大（上限 2000 万，当前 ' + w + '×' + h + '）' };
+    }
+    return { width: w, height: h };
+  }
+
+  // 本地估算最接近的官方组合（后端以 image_sizes 表为准，这里只做预览提示）
+  function nearestOfficial(w, h) {
+    const opts = enabledSizes();
+    if (!opts.length) return null;
+    const target = w / h;
+    const ratios = [];
+    opts.forEach((o) => { if (ratios.indexOf(o.ratio) < 0) ratios.push(o.ratio); });
+    let bestRatio = '', bestGap = Infinity;
+    ratios.forEach((r) => {
+      const parts = String(r).split(':');
+      const rv = Number(parts[0]) / Number(parts[1]);
+      if (!Number.isFinite(rv) || rv <= 0) return;
+      const gap = Math.abs(Math.log(target / rv));
+      if (gap < bestGap) { bestGap = gap; bestRatio = r; }
+    });
+    const tp = Math.log(w * h);
+    let best = null, bestPixelGap = Infinity;
+    opts.forEach((o) => {
+      if (o.ratio !== bestRatio) return;
+      const g = Math.abs(Math.log(o.width * o.height) - tp);
+      if (g < bestPixelGap) { bestPixelGap = g; best = o; }
+    });
+    return best ? { opt: best, gap: bestGap } : null;
+  }
+
+  // 自定义模式下隐藏档位下拉，换成宽高输入框
+  function toggleCustomInputs() {
+    const custom = isCustomSize();
+    const tierField = $('tier-field');
+    const wf = $('width-field'), hf = $('height-field');
+    if (tierField) tierField.hidden = custom;
+    if (wf) wf.hidden = !custom;
+    if (hf) hf.hidden = !custom;
+  }
+
+  function currentSize() {
+    const ratio = $('ratio').value;
+    const tier = $('tier').value;
+    return enabledSizes().find((o) => o.ratio === ratio && o.tier === tier) || null;
+  }
+
+  function sizePoints(opt) {
     const model = currentModel() || {};
-    const sizes = Array.isArray(model.sizes) && model.sizes.length ? model.sizes : DEFAULT_SIZES;
-    const keep = sel.value;
-    sel.innerHTML = sizes.map((s) => '<option value="' + esc(s) + '">' +
-      esc(String(s).replace('x', ' × ')) + '</option>').join('');
-    if (sizes.indexOf(keep) >= 0) sel.value = keep;
+    if (model.providerKind === 'local' && state.charge.freeLocal) return 0;
+    if (opt && Number(opt.points) > 0) return Number(opt.points);
+    return Number(state.charge.pointsPerImage) || 0;
+  }
+
+  function fillTiers(ratio, keepTier) {
+    const opts = enabledSizes().filter((o) => o.ratio === ratio);
+    const tierSel = $('tier');
+    tierSel.innerHTML = opts.map((o) =>
+      '<option value="' + esc(o.tier) + '">' + esc(o.tier) + '</option>').join('');
+    if (opts.some((o) => o.tier === keepTier)) tierSel.value = keepTier;
+    else if (opts.length) tierSel.value = opts[0].tier;
+    updateSizePixels();
+  }
+
+  function updateSizePixels() {
+    const px = $('size-pixels');
+    if (!px) return;
+    px.style.color = '';
+    if (isCustomSize()) {
+      const c = customSize();
+      if (c.error) {
+        px.style.color = '#fecaca';
+        px.textContent = c.error;
+        return;
+      }
+      const near = nearestOfficial(c.width, c.height);
+      const per = sizePoints(near ? near.opt : null);
+      let text = '自定义 ' + c.width + ' × ' + c.height +
+        '（单张 ' + (per > 0 ? per + ' 积分' : '免费') + '）';
+      if (near) {
+        const exact = near.opt.width === c.width && near.opt.height === c.height;
+        text += exact
+          ? '；精确命中官方 ' + near.opt.ratio + ' ' + near.opt.tier + ' → ' + near.opt.width + ' × ' + near.opt.height
+          : '；上游将按官方 ' + near.opt.ratio + ' ' + near.opt.tier + ' → ' +
+            near.opt.width + ' × ' + near.opt.height + ' 输出';
+        if (!exact && near.gap > Math.log(1.15)) {
+          text += '（宽高比与 8 种官方比例差别较大，可能被进一步归一化）';
+        }
+      }
+      px.textContent = text;
+      return;
+    }
+    const opt = currentSize();
+    if (!opt) {
+      px.textContent = '该比例下没有可用档位，请换一个比例';
+      return;
+    }
+    const per = sizePoints(opt);
+    px.textContent = opt.ratio + ' · ' + opt.tier + ' → ' + opt.width + ' × ' + opt.height +
+      '（单张 ' + (per > 0 ? per + ' 积分' : '免费') + '）';
+  }
+
+  function syncSizeControls() {
+    const ratioSel = $('ratio');
+    const tierSel = $('tier');
+    if (!ratioSel || !tierSel) return;
+    const opts = enabledSizes();
+    if (!opts.length) {
+      ratioSel.innerHTML = '<option value="">尺寸未加载</option>' +
+        '<option value="' + CUSTOM_RATIO + '">自定义</option>';
+      tierSel.innerHTML = '<option value="">—</option>';
+      const px = $('size-pixels');
+      if (px) px.textContent = '尺寸选项来自 /api/local/gallery/models；加载失败时请点刷新重试';
+      toggleCustomInputs();
+      return;
+    }
+    const ratios = [];
+    opts.forEach((o) => { if (ratios.indexOf(o.ratio) < 0) ratios.push(o.ratio); });
+    const keepR = ratioSel.value;
+    ratioSel.innerHTML = ratios.map((r) =>
+      '<option value="' + esc(r) + '">' + esc(r) + '</option>').join('') +
+      '<option value="' + CUSTOM_RATIO + '">自定义</option>';
+    const wantR = keepR === CUSTOM_RATIO ? CUSTOM_RATIO
+      : (ratios.indexOf(keepR) >= 0 ? keepR
+        : (ratios.indexOf('1:1') >= 0 ? '1:1' : ratios[0]));
+    ratioSel.value = wantR;
+    toggleCustomInputs();
+    if (isCustomSize()) updateSizePixels();
+    else fillTiers(wantR, tierSel.value);
     const btn = $('btn-generate');
+    const model = currentModel() || {};
     if (btn && model.providerKind === 'local') btn.textContent = '开始生成 · 本地免费';
     else if (btn) btn.textContent = '开始生成 · 按接入计费';
+  }
+
+  // 模型实际能力：种子上游不支持就禁用，避免留一个不生效的控件
+  function applyCapabilities() {
+    const model = currentModel() || {};
+    const cap = model.capabilities || {};
+    const seedEl = $('seed');
+    const seedField = $('seed-field');
+    const noSeed = cap.seed === false;
+    if (seedEl) {
+      seedEl.disabled = noSeed;
+      if (noSeed) seedEl.value = '0';
+    }
+    if (seedField) {
+      const label = seedField.querySelector('label');
+      if (label) label.innerHTML = '种子' + (noSeed
+        ? ' <span class="hint">当前模型不支持</span>' : '');
+      seedField.title = noSeed
+        ? 'Agnes 官方上游不接受 seed；只有本地占位绘图可按种子复现' : '';
+    }
+    const negEl = $('negative');
+    const noNeg = cap.negative === false;
+    if (negEl) {
+      negEl.disabled = noNeg;
+      if (noNeg) negEl.value = '';
+    }
+    const negHint = $('negative-hint');
+    if (negHint) {
+      negHint.textContent = noNeg
+        ? '当前模型不支持反向提示词'
+        : (cap.negativeViaPrompt ? '排除语义会并入提示词下发' : '直接作为负向词下发');
+    }
+    const negField = $('negative-field');
+    if (negField) negField.title = noNeg ? '本地占位绘图不使用 negative' : '';
+  }
+
+  function updatePoints() {
+    const n = Number($('num').value) || 1;
+    let per;
+    if (isCustomSize()) {
+      const c = customSize();
+      const near = c.error ? null : nearestOfficial(c.width, c.height);
+      per = sizePoints(near ? near.opt : null);
+    } else {
+      per = sizePoints(currentSize());
+    }
+    const total = per * n;
+    const bal = state.points;
+    const head = '本次 ' + (total > 0 ? total + ' 积分' : '免费') +
+      '（' + (per > 0 ? per : 0) + ' × ' + n + ' 张）';
+    $('points').textContent = head +
+      (bal === null || bal === undefined ? '' : ' · 余额 ' + bal);
   }
 
   /* ---------------------------------------------------------- 构建器 */
@@ -125,22 +327,31 @@
     updatePreview();
   }
 
+  // 按 BUILDER 分组顺序输出（画质 → 风格 → 光照 → 镜头），与点选先后无关
+  function orderedPicked() {
+    const out = [];
+    BUILDER.forEach((g) => g.items.forEach((t) => {
+      if (picked.has(t)) out.push(t);
+    }));
+    return out;
+  }
+
   function updatePreview() {
-    $('builder-preview').textContent = picked.size ? Array.from(picked).join('，') : '（未选择）';
+    $('builder-preview').textContent = picked.size ? orderedPicked().join('，') : '（未选择）';
     $('builder-apply').disabled = !picked.size;
   }
 
   function applyBuilder() {
     if (!picked.size) return;
     const input = $('prompt');
-    const add = Array.from(picked).join('，');
+    const add = orderedPicked().join('，');
     const text = (input.value || '').trim();
     input.value = text ? (text.replace(/[，,]\s*$/, '') + '，' + add) : add;
     picked.clear();
     renderBuilder();
     input.focus();
     if (state.recipe) refreshPreview();
-    U.toast('已追加 ' + Array.from(add.split('，')).length + ' 个风格词');
+    U.toast('已追加 ' + add.split('，').length + ' 个风格词');
   }
 
   /* ---------------------------------------------------------- 模板 */
@@ -270,6 +481,8 @@
       preview.hidden = true;
       preview.textContent = '';
       sizeField.hidden = false;
+      $('size-pixels').hidden = false;
+      syncSizeControls();
       $('template-hint').textContent = '';
       renderVideoModels();
       return;
@@ -280,6 +493,7 @@
       (promptField.required ? ' <span class="req">*</span>' : '');
     promptEl.placeholder = T.str(promptField.placeholder, '描述画面…');
     sizeField.hidden = true;
+    $('size-pixels').hidden = true;          // 模板自带比例，尺寸由模板解析
     preview.hidden = false;
     $('template-hint').textContent = T.str(recipe.description, '');
     renderTemplateFields(recipe);
@@ -388,6 +602,8 @@
       .then((data) => {
         state.works = T.asList(data, ['works']).filter((x) => T.isObj(x));
         state.models = T.asList(data, ['models']);
+        state.sizeOptions = T.asList(data, ['sizeOptions']).filter((o) => T.isObj(o));
+        state.charge = T.pick(data, ['charge'], state.charge) || state.charge;
         state.me = T.pick(data, ['me'], {});
         state.points = T.pick(data, ['points'], null);
         state.providers = T.num(T.pick(data, ['providers'], 0));
@@ -541,7 +757,55 @@
     const btn = $('btn-generate');
     const progress = $('progress');
     const hint = $('hint');
-    const seed = Math.max(0, Math.min(2147483647, Number($('seed').value) || 0));
+    const seedEl = $('seed');
+    const negEl = $('negative');
+    const opt = currentSize();
+    const seed = seedEl.disabled ? 0 : Math.max(0, Math.min(2147483647, Number(seedEl.value) || 0));
+    const n = Number($('num').value) || 1;
+    let custom = null;
+    if (!extra.recipeKey && isCustomSize()) {
+      const c = customSize();
+      if (c.error) {
+        hint.textContent = c.error;
+        hint.style.color = '#fecaca';
+        return;
+      }
+      custom = c;
+    }
+    const payload = extra.recipeKey
+      // 模板：比例由模板字段决定，后端按 pick_size 反查数据库尺寸表
+      ? {
+        prompt,
+        negative: negEl.disabled ? '' : (negEl.value || '').trim(),
+        rateId: Number(state.rateId),
+        n,
+        seed,
+        recipeKey: extra.recipeKey,
+        fields: extra.fields || {},
+      }
+      // 自定义宽高：ratio="custom" + width/height；后端先精确匹配官方表，
+      // 匹配不到再归一化为最接近的官方比例 + 档位，并回传 requested/actual
+      : custom
+        ? {
+          prompt,
+          negative: negEl.disabled ? '' : (negEl.value || '').trim(),
+          rateId: Number(state.rateId),
+          ratio: CUSTOM_RATIO,
+          width: custom.width,
+          height: custom.height,
+          n,
+          seed,
+        }
+        // 官方语义 size=档位、ratio=比例；查询不到后端会明确报错
+        : {
+          prompt,
+          negative: negEl.disabled ? '' : (negEl.value || '').trim(),
+          rateId: Number(state.rateId),
+          size: opt ? opt.tier : '1K',
+          ratio: opt ? opt.ratio : '1:1',
+          n,
+          seed,
+        };
     state.busy = true;
     btn.disabled = true;
     btn.textContent = '生成中…';
@@ -550,25 +814,34 @@
     hint.textContent = '';
     hint.style.color = '';
 
-    A.post(G + '/generate', {
-      prompt,
-      negative: ($('negative').value || '').trim(),
-      rateId: Number(state.rateId),
-      size: $('size').value,
-      n: Number($('num').value),
-      seed,
-      recipeKey: extra.recipeKey || '',
-      fields: extra.fields || {},
-    }, { timeout: 120000 })
+    A.post(G + '/generate', payload, { timeout: 120000 })
       .then((data) => {
         const works = T.asList(data, ['works']);
         const used = T.num(T.pick(data, ['pointsDeducted'], 0), 0);
+        const px = T.str(T.pick(data, ['pixels'], ''));
+        const ratio = T.str(T.pick(data, ['ratio'], ''));
+        const tier = T.str(T.pick(data, ['tier'], ''));
+        const reqPx = T.str(T.pick(data, ['requestedPixels'], ''));
+        const actPx = T.str(T.pick(data, ['actualPixels'], px));
+        const normalized = !!T.pick(data, ['normalized'], false);
+        const aspectWarning = !!T.pick(data, ['aspectWarning'], false);
         U.toast('已生成 ' + works.length + ' 张' +
           (used > 0 ? '，扣除 ' + used + ' 积分' : ''));
+        let sizeText = '';
+        if (px) {
+          sizeText = normalized && reqPx
+            ? '（请求 ' + reqPx + ' → 实际 ' + actPx +
+              '，已归一化为官方 ' + (ratio ? ratio + ' ' : '') + (tier || '') + '）'
+            : '（' + (ratio ? ratio + ' ' : '') + (tier ? tier + ' ' : '') + px + '）';
+        }
+        if (normalized && reqPx) {
+          sizeText += ' 上游不支持精确自定义尺寸，已按最接近的官方组合输出' +
+            (aspectWarning ? '；宽高比偏差较大，建议改用预设比例' : '') + '。';
+        }
         if (T.pick(data, ['local'], false)) {
-          hint.textContent = '这次用的是本地占位绘图（未调用真实 API），换个种子可得到不同配色。';
+          hint.textContent = '这次用的是本地占位绘图（未调用真实 API），换个种子可得到不同配色。' + sizeText;
         } else {
-          hint.textContent = works.length + ' 张已存入「我的图库」。';
+          hint.textContent = works.length + ' 张已存入「我的图库」。' + sizeText;
         }
         loadGallery();
       })
@@ -586,7 +859,9 @@
         state.busy = false;
         btn.disabled = false;
         progress.hidden = true;
-        syncSizes();
+        syncSizeControls();
+        applyCapabilities();
+        updatePoints();
       });
   }
 
@@ -597,7 +872,8 @@
     btn.disabled = false;
     btn.textContent = '开始生成';
     $('progress').hidden = true;
-    syncSizes();
+    syncSizeControls();
+    updatePoints();
   }
 
   function runGenerateVideo(prompt) {
@@ -723,6 +999,29 @@
     renderBuilder();
   });
   $('template').addEventListener('change', () => applyTemplate($('template').value));
+
+  // 比例变了要重灌档位；切到「自定义」时换成宽高输入框
+  $('ratio').addEventListener('change', () => {
+    toggleCustomInputs();
+    if (isCustomSize()) updateSizePixels();
+    else fillTiers($('ratio').value, $('tier').value);
+    updatePoints();
+  });
+  $('tier').addEventListener('change', () => {
+    updateSizePixels();
+    updatePoints();
+  });
+  ['width', 'height'].forEach((id) => {
+    $(id).addEventListener('input', () => {
+      updateSizePixels();
+      updatePoints();
+    });
+    $(id).addEventListener('change', () => {
+      updateSizePixels();
+      updatePoints();
+    });
+  });
+  $('num').addEventListener('change', () => updatePoints());
 
   $('video-model-list').addEventListener('click', (e) => {
     const prov = e.target.closest('[data-video-provider]');

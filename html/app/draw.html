@@ -43,7 +43,7 @@
   <script src="/app/js/core/store.js"></script>
   <script src="/app/js/core/ui.js"></script>
 </head>
-<body>
+<body class="page-draw">
 <div id="topbar"></div>
 
 <div class="page-wrap">
@@ -97,15 +97,32 @@
             <textarea class="textarea" id="prompt" rows="4"
               placeholder="描述画面：人物、场景、光线、构图…"></textarea>
           </div>
-          <div class="field">
-            <label>反向提示词</label>
+          <div class="field" id="negative-field">
+            <label>反向提示词 <span class="hint" id="negative-hint">排除语义会并入提示词下发给模型</span></label>
             <input class="input" id="negative" placeholder="不希望出现的元素（可留空）">
           </div>
-          <div class="row" style="gap:12px;align-items:flex-end">
-            <div class="field grow" style="margin:0" id="size-field">
-              <label>尺寸</label>
-              <select class="select" id="size"></select>
+          <div class="row" style="gap:12px;align-items:flex-end" id="size-field">
+            <div class="field grow" style="margin:0">
+              <label>画面比例</label>
+              <select class="select" id="ratio"></select>
             </div>
+            <div class="field" style="margin:0;width:110px" id="tier-field">
+              <label>清晰度</label>
+              <select class="select" id="tier"></select>
+            </div>
+            <div class="field" style="margin:0;width:96px" id="width-field" hidden>
+              <label>宽度 px</label>
+              <input class="input" id="width" type="number" min="64" max="8192" step="1"
+                value="1024" inputmode="numeric">
+            </div>
+            <div class="field" style="margin:0;width:96px" id="height-field" hidden>
+              <label>高度 px</label>
+              <input class="input" id="height" type="number" min="64" max="8192" step="1"
+                value="1024" inputmode="numeric">
+            </div>
+          </div>
+          <p class="tiny muted" id="size-pixels" style="margin:8px 0 0">—</p>
+          <div class="row" style="gap:12px;align-items:flex-end;margin-top:10px">
             <div class="field" style="margin:0;width:100px">
               <label>数量</label>
               <select class="select" id="num">
@@ -114,7 +131,7 @@
                 <option value="4">4 张</option>
               </select>
             </div>
-            <div class="field" style="margin:0;width:130px">
+            <div class="field" style="margin:0;width:130px" id="seed-field">
               <label>种子</label>
               <input class="input" id="seed" type="number" min="0" max="2147483647" value="0">
             </div>

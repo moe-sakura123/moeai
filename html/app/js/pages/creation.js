@@ -10,6 +10,73 @@
   const esc = U.esc;
 
   const EP = '/api/gva/narratiumWorldbookEntry/';
+  const GALLERY = '/api/local/gallery';
+  // 尺寸全部由 /api/local/gallery/models 的 sizeOptions（数据库 image_sizes）驱动
+  let galleryModelCache = null;
+
+  function loadGalleryModel() {
+    if (galleryModelCache) return Promise.resolve(galleryModelCache);
+    return A.get(GALLERY + '/models', undefined, { timeout: 8000 })
+      .then((data) => {
+        const list = T.asList(data, ['models']).filter((m) => T.isObj(m));
+        galleryModelCache = {
+          model: list.find((m) => m.isDefault) || list[0] || null,
+          sizeOptions: T.asList(data, ['sizeOptions']).filter((o) => T.isObj(o)),
+          charge: T.pick(data, ['charge'], {}),
+        };
+        return galleryModelCache;
+      })
+      .catch(() => {
+        galleryModelCache = { model: null, sizeOptions: [], charge: {} };
+        return galleryModelCache;
+      });
+  }
+
+  // 按原图宽高吸附到最接近的官方比例，再在同比例里选像素最接近的档位
+  function snapCgSize(opts, w, h) {
+    const target = w / h;
+    const ratios = [];
+    opts.forEach((o) => { if (ratios.indexOf(o.ratio) < 0) ratios.push(o.ratio); });
+    let bestRatio = '', bestGap = Infinity;
+    ratios.forEach((r) => {
+      const p = String(r).split(':');
+      const rv = Number(p[0]) / Number(p[1]);
+      if (!Number.isFinite(rv) || rv <= 0) return;
+      // 对数距离：接近 3:4 的图不会被 1:1 抢走
+      const gap = Math.abs(Math.log(target / rv));
+      if (gap < bestGap) { bestGap = gap; bestRatio = r; }
+    });
+    const tp = Math.log(w * h);
+    let best = null, bestPixelGap = Infinity;
+    opts.forEach((o) => {
+      if (o.ratio !== bestRatio) return;
+      const g = Math.abs(Math.log(o.width * o.height) - tp);
+      if (g < bestPixelGap) { bestPixelGap = g; best = o; }
+    });
+    return best ? { opt: best, gap: bestGap } : null;
+  }
+
+  // 与后端 _cg_ai_compose 同序：备注最前（核心约束），角色→场景→情绪→动作补在后
+  const CG_AI_SEGMENTS = [
+    ['character', '角色', '角色标签'],
+    ['scene', '场景', '场景标签'],
+    ['emotion', '情绪', '情绪标签'],
+    ['action', '动作/状态', '动作标签'],
+  ];
+
+  function composeCgPrompt(desc, tags) {
+    const segs = [];
+    if (desc) segs.push({ key: 'note', label: '备注（核心约束）', source: '手动填写', text: desc });
+    CG_AI_SEGMENTS.forEach(([k, label, source]) => {
+      const vals = (tags[k] || []).filter(Boolean);
+      if (vals.length) {
+        segs.push({ key: k, label: label, source: source, text: vals.join('、') });
+      }
+    });
+    const prompt = segs.map((s) => (s.key === 'note' ? s.text : s.label + '：' + s.text))
+      .join('\n').trim();
+    return { segs, prompt };
+  }
 
   const state = {
     works: [],
@@ -1929,10 +1996,37 @@
     }
 
     const html =
+      // AI 生成前先回显完整提示词：分段来源 + 可编辑全文 + 费用，确认后才发。
+      // 放在弹窗最上方，点按钮立刻出现在可视区，不会“点了没反应”。
+      '<div id="cg-ai-panel" hidden style="margin-bottom:16px;border:1px solid rgba(255,255,255,.16);' +
+        'border-radius:12px;padding:12px;background:rgba(255,255,255,.03)">' +
+        '<div class="tiny muted">最终提示词预览（备注固定第一段·核心约束；可直接修改后再生成）</div>' +
+        '<div id="cg-ai-segs" class="tiny" style="margin-top:6px"></div>' +
+        '<textarea id="cg-ai-prompt" class="textarea" rows="6" ' +
+          'style="width:100%;margin-top:8px" placeholder="提示词"></textarea>' +
+        '<div style="display:flex;gap:10px;margin-top:8px;flex-wrap:wrap">' +
+          '<div style="min-width:170px"><div class="tiny muted">尺寸</div>' +
+            '<select class="select" id="cg-ai-size"></select>' +
+            '<div class="tiny" id="cg-ai-size-note" style="margin-top:4px;line-height:1.5"></div></div>' +
+          '<div style="flex:1;min-width:180px"><div class="tiny muted">负向提示词（可留空）</div>' +
+            '<input class="input" id="cg-ai-negative" placeholder="不希望出现的元素"></div>' +
+        '</div>' +
+        '<div class="tiny" id="cg-ai-cost" style="margin-top:6px"></div>' +
+        '<div style="display:flex;gap:8px;margin-top:8px">' +
+          '<button class="btn" type="button" id="cg-ai-cancel">取消</button>' +
+          '<button class="btn primary" type="button" id="cg-ai-go">确认生成</button>' +
+        '</div>' +
+      '</div>' +
       '<div style="display:grid;grid-template-columns:260px 1fr;gap:18px">' +
         '<div><div class="tiny muted">图片预览</div>' +
-          '<img src="' + esc(url) + '" style="width:100%;border-radius:8px;display:block">' +
-          '<div class="tiny muted" style="margin-top:6px">' + esc(T.str(x.imageName, '')) + '</div>' +
+          '<img id="cg-editor-preview" src="' + esc(url) + '" style="width:100%;border-radius:8px;display:block">' +
+          '<div class="tiny muted" id="cg-editor-name" style="margin-top:6px">' + esc(T.str(x.imageName, '')) + '</div>' +
+          '<button class="btn sm" type="button" id="cg-editor-replace" style="margin-top:8px;width:100%">替换 CG 图片</button>' +
+          '<button class="btn sm" type="button" id="cg-editor-ai" style="margin-top:8px;width:100%">AI 生成 CG</button>' +
+          '<div class="tiny muted" id="cg-editor-ai-hint" style="margin-top:6px">' +
+            '按备注（核心约束）+ 角色/场景/情绪/动作标签拼提示词，先预览可改再生成，' +
+            '生成后原地替换这张图</div>' +
+          '<input type="file" id="cg-editor-replace-file" accept="image/*" hidden>' +
         '</div>' +
         '<div>' +
           tagEditorRow('角色', 'character') +
@@ -2058,6 +2152,323 @@
             inp.value = '';
             rerenderChips(key);
           });
+        });
+        // 替换图片：上传新图后原地替换这条 CG，保留标签与触发配置
+        const repBtn = mod.querySelector('#cg-editor-replace');
+        const repFile = mod.querySelector('#cg-editor-replace-file');
+        repBtn.addEventListener('click', () => repFile.click());
+        repFile.addEventListener('change', () => {
+          const file = repFile.files && repFile.files[0];
+          repFile.value = '';
+          if (!file) return;
+          if (!state.cid) { U.toast('请先保存作品', false); return; }
+          repBtn.disabled = true;
+          U.toast('上传中…');
+          A.upload('/api/gva/narratium/cg/upload', file,
+            { characterId: state.cid, replaceId: id })
+            .then((data) => {
+              if (data && data.ok === false) throw new Error(data.error || '替换失败');
+              const next = data || {};
+              const newUrl = T.str(T.pick(next, ['url', 'imageURL', 'imageUrl']), '');
+              if (newUrl) {
+                mod.querySelector('#cg-editor-preview').src = newUrl;
+                x.url = newUrl;
+                x.imageURL = newUrl;
+              }
+              const newName = T.str(next.imageName, file.name);
+              mod.querySelector('#cg-editor-name').textContent = newName;
+              x.imageName = newName;
+              const i = state.cg.findIndex((c) => T.str(T.pick(c, ['id', 'imageId'])) === id);
+              if (i >= 0) Object.assign(state.cg[i], x);
+              renderCG();
+              U.toast('CG 图片已替换');
+            })
+            .catch((err) => U.toast('替换失败：' + err.message, false))
+            .finally(() => { repBtn.disabled = false; });
+        });
+        // AI 生成：本地拼装提示词（备注核心约束在最前）→ 用绘图广场同一接口预览费用 →
+        // 确认后同一接口出图，再把结果接现有 /cg/upload 落库/替换（不另起一套）。
+        const aiBtn = mod.querySelector('#cg-editor-ai');
+        const aiPanel = mod.querySelector('#cg-ai-panel');
+        const aiSegs = mod.querySelector('#cg-ai-segs');
+        const aiPrompt = mod.querySelector('#cg-ai-prompt');
+        const aiCost = mod.querySelector('#cg-ai-cost');
+        const aiGo = mod.querySelector('#cg-ai-go');
+        const aiCancel = mod.querySelector('#cg-ai-cancel');
+        const aiSize = mod.querySelector('#cg-ai-size');
+        const aiNegative = mod.querySelector('#cg-ai-negative');
+        const aiDesc = mod.querySelector('[data-f="description"]');
+        const aiSizeNote = mod.querySelector('#cg-ai-size-note');
+        let aiBusy = false;
+        let aiModel = null;
+        let aiCharged = false;
+        let aiSizeOpts = [];
+        let aiSizeTouched = false;
+        // 被编辑 CG 的真实宽高：优先读图片本身的 natural 像素，记录里的宽高先兜底
+        let cgSourceSize = null;
+        const recW = Number(T.pick(x, ['imageWidth', 'width'], 0)) || 0;
+        const recH = Number(T.pick(x, ['imageHeight', 'height'], 0)) || 0;
+        if (recW > 0 && recH > 0) {
+          cgSourceSize = { width: recW, height: recH, from: 'record' };
+        }
+
+        function setSizeNote(text, kind) {
+          if (!aiSizeNote) return;
+          aiSizeNote.textContent = text;
+          aiSizeNote.style.color = kind === 'fallback' ? '#fbbf24'
+            : kind === 'manual' ? 'rgba(255,255,255,.85)' : 'rgba(255,255,255,.72)';
+        }
+
+        // 默认值：按原图吸附到最接近的官方比例 + 最接近的档位；拿不到原图尺寸回退 3:4 + 1K
+        function applyDefaultSize() {
+          const opts = aiSizeOpts.filter((o) => o && o.enabled !== false);
+          if (!opts.length) return;
+          let pick = null;
+          if (cgSourceSize) {
+            const snap = snapCgSize(opts, cgSourceSize.width, cgSourceSize.height);
+            pick = snap && snap.opt;
+          }
+          if (pick) {
+            aiSize.value = pick.ratio + '|' + pick.tier;
+            setSizeNote('最佳比例 · 跟随原图 ' + pick.ratio + ' · 清晰度 ' + pick.tier +
+              '（贴近原图 ' + cgSourceSize.width + '×' + cgSourceSize.height +
+              '，输出 ' + pick.width + '×' + pick.height + '）', 'auto');
+            return;
+          }
+          pick = opts.find((o) => o.ratio === '3:4' && o.tier === '1K')
+            || opts.find((o) => o.tier === '1K') || opts[0];
+          aiSize.value = pick.ratio + '|' + pick.tier;
+          setSizeNote('回退值（原图尺寸读取失败）· ' + pick.ratio + ' · ' + pick.tier +
+            '（' + pick.width + '×' + pick.height + '）', 'fallback');
+        }
+
+        const fillSizes = (cache) => {
+          aiSizeOpts = ((cache && cache.sizeOptions) || []).filter((o) => o && o.enabled);
+          aiSize.innerHTML = aiSizeOpts.map((o) =>
+            '<option value="' + esc(o.ratio + '|' + o.tier) + '">' +
+            esc(o.ratio + ' · ' + o.tier + ' · ' + o.width + '×' + o.height +
+              (Number(o.points) > 0 ? '（' + o.points + ' 积分）' : '')) +
+            '</option>').join('');
+          if (!aiSizeOpts.length) {
+            aiSize.innerHTML = '<option value="">尺寸未加载</option>';
+            setSizeNote('尺寸选项未加载，请刷新页面重试', 'fallback');
+            return;
+          }
+          if (!aiSizeTouched) applyDefaultSize();
+        };
+        loadGalleryModel().then((cache) => { aiModel = cache.model; fillSizes(cache); });
+
+        // 图片加载完成后用真实像素覆盖记录值，并刷新默认吸附（用户手动改过就不再改）
+        const previewImg = mod.querySelector('#cg-editor-preview');
+        const readImageSize = () => {
+          if (!previewImg || !previewImg.naturalWidth || !previewImg.naturalHeight) return;
+          cgSourceSize = { width: previewImg.naturalWidth,
+                           height: previewImg.naturalHeight, from: 'image' };
+          if (!aiSizeTouched) applyDefaultSize();
+        };
+        if (previewImg) {
+          if (previewImg.complete) readImageSize();
+          previewImg.addEventListener('load', readImageSize);
+          previewImg.addEventListener('error', () => {
+            if (!cgSourceSize) { aiSizeTouched = false; applyDefaultSize(); }
+          });
+        }
+
+        aiSize.addEventListener('change', () => {
+          aiSizeTouched = true;
+          const hit = aiSizeOpts.find((o) => o.ratio + '|' + o.tier === aiSize.value);
+          if (hit) {
+            setSizeNote('手动选择 · ' + hit.ratio + ' · ' + hit.tier +
+              '（' + hit.width + '×' + hit.height + '）', 'manual');
+          } else {
+            setSizeNote('手动选择', 'manual');
+          }
+        });
+
+        const aiFields = () => ({
+          characterId: state.cid,
+          replaceId: id,
+          description: aiDesc ? String(aiDesc.value || '').trim() : '',
+          characterTags: tags.character.slice(),
+          sceneTags: tags.scene.slice(),
+          emotionTags: tags.emotion.slice(),
+          actionTags: tags.action.slice(),
+        });
+
+        // 与绘图广场 /api/local/gallery/generate 完全同一套字段（比例 + 档位）
+        const aiParams = (promptText, dryRun) => {
+          const token = String((aiSize && aiSize.value) || '');
+          const sep = token.indexOf('|');
+          const ratio = sep >= 0 ? token.slice(0, sep) : '';
+          const tier = sep >= 0 ? token.slice(sep + 1) : '';
+          return {
+            prompt: promptText,
+            negative: String((aiNegative && aiNegative.value) || '').trim(),
+            rateId: Number((aiModel && aiModel.ID) || 0),
+            size: tier,
+            ratio,
+            n: 1,
+            seed: 0,
+            dryRun: !!dryRun,
+          };
+        };
+
+        const showPreview = (segs, draft, data) => {
+          aiPanel.hidden = false;
+          aiSegs.innerHTML = segs.map((s) =>
+            '<div style="margin-bottom:4px">' +
+              '<span style="opacity:.65">' + esc(s.label) + ' · 来源：' + esc(s.source) + '</span>' +
+              '<div style="white-space:pre-wrap">' + esc(s.text) + '</div>' +
+            '</div>').join('');
+          aiPrompt.value = T.str(T.pick(data || {}, ['prompt'], draft));
+          const cost = Number(data && data.cost) || 0;
+          const bal = Number(data && data.balance) || 0;
+          if (data && data.canAfford === false) {
+            aiCost.innerHTML = '<span style="color:#f87171">积分不足：本次需要 ' + cost +
+              ' 积分，当前余额 ' + bal + '</span>';
+            aiGo.disabled = true;
+            aiGo.textContent = '积分不足';
+            U.toast('积分不足：本次需要 ' + cost + ' 积分，当前余额 ' + bal, false);
+          } else {
+            aiCost.innerHTML = '本次消耗 <b>' + cost + '</b> 积分 · 当前余额 <b>' + bal +
+              '</b>' + (data && data.local ? ' · 本地占位绘图（占位图，非真实画面）'
+                                           : ' · ' + esc(T.str(data && data.providerName)));
+            aiGo.disabled = !String(aiPrompt.value || '').trim();
+            aiGo.textContent = '确认生成';
+          }
+          aiGo.setAttribute('data-afford', data && data.canAfford === false ? '0' : '1');
+          // 弹窗内容可能被滚动过：把预览面板滚进可视区，确保点完立刻看到结果
+          if (aiPanel.scrollIntoView) {
+            aiPanel.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+          }
+        };
+
+        aiBtn.addEventListener('click', () => {
+          if (aiBusy) return;
+          if (!state.cid) { U.toast('请先保存作品', false); return; }
+          const f = aiFields();
+          if (!f.description && !f.characterTags.length && !f.sceneTags.length &&
+              !f.emotionTags.length && !f.actionTags.length) {
+            U.toast('备注或标签至少填一项', false);
+            return;
+          }
+          const composed = composeCgPrompt(f.description, tags);
+          if (!composed.prompt) { U.toast('备注和标签都为空，先填一项再生成', false); return; }
+          aiBtn.disabled = true;
+          const oldText = aiBtn.textContent;
+          aiBtn.textContent = '拼装中…';
+          loadGalleryModel().then((cache) => {
+            aiModel = cache.model;
+            if (!aiSize.options.length || !String(aiSize.value || '')) fillSizes(cache);
+            if (!String(aiSize.value || '')) {
+              throw new Error('尺寸选项未加载，请刷新页面后重试');
+            }
+            return A.post(GALLERY + '/generate', aiParams(composed.prompt, true),
+              { timeout: 15000 });
+          })
+            .then((data) => showPreview(composed.segs, composed.prompt, data))
+            .catch((err) => U.toast(err.message, false))
+            .finally(() => {
+              aiBtn.disabled = false;
+              aiBtn.textContent = oldText;
+            });
+        });
+
+        aiPrompt.addEventListener('input', () => {
+          if (aiBusy) return;
+          aiGo.disabled = aiGo.getAttribute('data-afford') === '0'
+            || !String(aiPrompt.value || '').trim();
+        });
+
+        aiCancel.addEventListener('click', () => {
+          if (aiBusy) return;
+          aiPanel.hidden = true;
+        });
+
+        aiGo.addEventListener('click', () => {
+          if (aiBusy) return;
+          if (aiGo.getAttribute('data-afford') === '0') {
+            U.toast('积分不足，无法生成', false);
+            return;
+          }
+          const promptText = String(aiPrompt.value || '').trim();
+          if (!promptText) { U.toast('提示词不能为空', false); return; }
+          if (!state.cid) { U.toast('请先保存作品', false); return; }
+          aiBusy = true;
+          aiCharged = false;
+          aiGo.disabled = true;
+          aiCancel.disabled = true;
+          aiBtn.disabled = true;
+          const oldText = aiBtn.textContent;
+          aiBtn.textContent = '生成中…';
+          aiGo.textContent = '生成中…';
+          aiCost.innerHTML = '生成中，请稍候…（失败不会扣积分）';
+          A.post(GALLERY + '/generate', aiParams(promptText, false), { timeout: 180000 })
+            .then((data) => {
+              const works = T.asList(data, ['works']);
+              const work = works[0] || {};
+              const urlKey = T.str(T.pick(work, ['url_key', 'url', 'path'], ''));
+              if (!urlKey) throw new Error('生成成功但没有返回图片地址');
+              aiCharged = true;
+              return fetch(urlKey, { credentials: 'same-origin', cache: 'no-store' })
+                .then((res) => {
+                  if (!res.ok) throw new Error('图片读取失败（HTTP ' + res.status + '）');
+                  return res.blob();
+                })
+                .then((blob) => {
+                  const isJpg = String(blob.type || '').indexOf('jpeg') >= 0;
+                  const file = new File([blob], 'ai_cg_' + Date.now() + (isJpg ? '.jpg' : '.png'),
+                    { type: blob.type || 'image/png' });
+                  return A.upload('/api/gva/narratium/cg/upload', file,
+                    { characterId: state.cid, replaceId: id })
+                    .then((up) => ({ up: up || {}, gen: data || {} }));
+                });
+            })
+            .then((res) => {
+              const up = res.up || {};
+              const gen = res.gen || {};
+              if (up.ok === false) throw new Error(up.error || 'CG 落库失败');
+              const newUrl = T.str(T.pick(up, ['url', 'imageURL', 'imageUrl']), '');
+              if (newUrl) {
+                mod.querySelector('#cg-editor-preview').src = newUrl;
+                x.url = newUrl;
+                x.imageURL = newUrl;
+              }
+              const newName = T.str(up.imageName, '');
+              if (newName) {
+                mod.querySelector('#cg-editor-name').textContent = newName;
+                x.imageName = newName;
+              }
+              const i = state.cg.findIndex((c) => T.str(T.pick(c, ['id', 'imageId'])) === id);
+              if (i >= 0) Object.assign(state.cg[i], x);
+              renderCG();
+              aiPanel.hidden = true;
+              const used = Number(gen.pointsDeducted) || 0;
+              const outPx = T.str(T.pick(gen, ['actualPixels', 'pixels'], ''));
+              const reqPx = T.str(T.pick(gen, ['requestedPixels'], ''));
+              const norm = !!T.pick(gen, ['normalized'], false);
+              const tip = (used
+                ? '已生成并替换（消耗 ' + used + ' 积分，余额 ' + gen.balance + '）'
+                : '已生成并替换') +
+                (outPx ? ' · 输出 ' + outPx : '') +
+                (norm && reqPx ? '（请求 ' + reqPx + ' 已归一化）' : '');
+              U.toast(tip + (gen.local ? '（占位图，非真实画面）' : ''));
+            })
+            .catch((err) => {
+              aiCost.innerHTML = '<span style="color:#f87171">' + esc(err.message) +
+                (aiCharged ? '（图片已生成，积分已按绘图接口扣除）'
+                           : '（本次未扣积分）') + '</span>';
+              U.toast(err.message, false);
+            })
+            .finally(() => {
+              aiBusy = false;
+              aiBtn.disabled = false;
+              aiBtn.textContent = oldText;
+              aiCancel.disabled = false;
+              aiGo.textContent = '确认生成';
+              aiGo.disabled = aiGo.getAttribute('data-afford') === '0'
+                || !String(aiPrompt.value || '').trim();
+            });
         });
         mod.querySelector('#cg-editor-save').addEventListener('click', () => {
           const src = [];
