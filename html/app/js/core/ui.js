@@ -11,9 +11,9 @@
     { key: 'chat', label: '聊天', href: '/app/chat' },
     { key: 'plaza', label: '创意广场', href: '/app/plaza' },
     { key: 'draw', label: 'AI 绘图', href: '/app/draw' },
-    { key: 'console', label: '控制台', href: '/app/console' },
     { key: 'works', label: '我的作品', href: '/app/works' },
     { key: 'account', label: '账号管理', href: '/app/account' },
+    { key: 'console', label: '控制台', href: '/app/console' },
   ];
 
   function esc(v) {
@@ -59,6 +59,67 @@
         esc(n.label) + '</a>').join('') + '</nav>' +
       '<div class="app-topbar-right" id="topbar-user"></div>';
     renderUser();
+    mountMobileNav();
+  }
+
+  /* 手机竖屏导航：统一用右上角 ☰ 按钮呼出固定浮层抽屉，全站行为一致。
+     抽屉复用顶部 #topbar 结构（导航项 + 账号操作），浮层不占内容高度。
+     桌面/横屏按钮由 CSS 隐藏，顶栏保持原样。 */
+  let mobileNavBound = false;
+  function mountMobileNav() {
+    let btn = document.getElementById('chat-menu-btn');
+    if (!btn) {
+      btn = document.createElement('button');
+      btn.type = 'button';
+      btn.id = 'chat-menu-btn';
+      btn.className = 'chat-menu-btn';
+      btn.innerHTML = '<span class="cmb-lines" aria-hidden="true"><i></i><i></i><i></i></span>';
+      document.body.appendChild(btn);
+    }
+    btn.setAttribute('aria-controls', 'topbar');
+    btn.setAttribute('aria-label', '打开导航菜单');
+    btn.setAttribute('aria-expanded', 'false');
+    if (mobileNavBound) return btn;
+    mobileNavBound = true;
+
+    const host = document.getElementById('topbar');
+    const mq = window.matchMedia('(max-width: 900px) and (orientation: portrait)');
+    const isOpen = () => document.body.classList.contains('nav-open');
+    const setOpen = (open) => {
+      const on = !!open && mq.matches;
+      document.body.classList.toggle('nav-open', on);
+      btn.setAttribute('aria-expanded', on ? 'true' : 'false');
+      btn.setAttribute('aria-label', on ? '关闭导航菜单' : '打开导航菜单');
+    };
+
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      setOpen(!isOpen());
+    });
+    if (host) {
+      // 点任一菜单项/账号入口后立即关闭，链接继续正常跳转
+      host.addEventListener('click', (e) => {
+        const t = e.target;
+        if (t instanceof Element && t.closest('a, button')) setOpen(false);
+      });
+    }
+    // 点浮层外部关闭
+    document.addEventListener('click', (e) => {
+      if (!isOpen()) return;
+      const t = e.target;
+      if (t instanceof Element && t.closest('.app-topbar, #chat-menu-btn')) return;
+      setOpen(false);
+    });
+    // Esc 关闭
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') setOpen(false);
+    });
+    // 竖屏切横屏 / 断点变化时关闭，避免状态残留
+    const onChange = () => setOpen(false);
+    if (mq.addEventListener) mq.addEventListener('change', onChange);
+    else if (mq.addListener) mq.addListener(onChange);
+    window.addEventListener('orientationchange', onChange);
+    return btn;
   }
 
   function renderUser() {
@@ -312,6 +373,20 @@
     return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
       ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
   }
+
+  /* Android 地址栏伸缩/软键盘：把 visualViewport 实际高度写入 --app-vh，
+     供窄屏满屏布局（chat）与输入框滚动留白使用；桌面端不启用，避免影响像素表现。 */
+  (function bindViewportVar() {
+    const vv = window.visualViewport;
+    if (!vv || !window.matchMedia('(max-width: 900px)').matches) return;
+    const root = document.documentElement;
+    let raf = 0;
+    const apply = () => root.style.setProperty('--app-vh', Math.round(vv.height) + 'px');
+    const schedule = () => { cancelAnimationFrame(raf); raf = requestAnimationFrame(apply); };
+    apply();
+    vv.addEventListener('resize', schedule);
+    vv.addEventListener('scroll', schedule);
+  })();
 
   App.ui = {
     esc, placeholder, safeImg, mountTopbar, renderUser,

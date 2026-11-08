@@ -12,11 +12,23 @@
   <script src="/app/js/core/ui.js"></script>
   <script src="/app/js/core/sse.js?v=5"></script>
 </head>
-<body>
+<body class="page-chat">
 <div id="topbar"></div>
+<button type="button" class="chat-menu-btn" id="chat-menu-btn"
+        aria-label="打开导航菜单" aria-expanded="false" aria-controls="topbar">
+  <span class="cmb-lines" aria-hidden="true"><i></i><i></i><i></i></span>
+</button>
 
 <div class="chat-shell">
-  <aside class="chat-side">
+  <aside class="chat-side" id="chat-side">
+    <!-- 手机竖屏浮层右上角的圆形收起按钮（与桌面收展按钮同款，桌面隐藏） -->
+    <button type="button" class="chat-panel-close" id="btn-sessions-close"
+            aria-controls="chat-side" aria-label="收起会话面板" title="收起会话面板">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+        stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M15 6l-6 6 6 6"/>
+      </svg>
+    </button>
     <div class="char">
       <div class="row" style="align-items:flex-start;gap:12px">
         <img id="c-avatar" alt="" src="">
@@ -47,7 +59,18 @@
   </aside>
 
   <section class="chat-main">
+    <!-- 左栏收展按钮：桌面贴在分隔线右侧；手机竖屏用作「唤出会话浮层」的圆形箭头按钮 -->
+    <button type="button" class="chat-side-toggle" id="btn-side-toggle"
+            aria-controls="chat-side" aria-expanded="true" aria-label="收起侧栏" title="收起侧栏">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+        stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M15 6l-6 6 6 6"/>
+      </svg>
+    </button>
     <div class="chat-titlebar">
+      <!-- 手机竖屏：侧栏不再占位，由这里呼出会话浮层；桌面/横屏隐藏 -->
+      <button type="button" class="btn sm ghost chat-sessions-btn" id="btn-sessions"
+              aria-controls="chat-side" aria-expanded="false" aria-label="打开会话面板">会话</button>
       <b id="chat-title">—</b>
       <div class="row" style="gap:8px">
         <span id="chat-state" class="tiny muted"></span>
@@ -60,7 +83,7 @@
             <div class="mm-list" id="model-list"></div>
           </div>
         </div>
-        <button class="btn sm ghost" id="btn-clear">清空对话</button>
+        <button class="btn sm ghost" id="btn-clear" aria-label="清空对话" title="清空对话">清空对话</button>
       </div>
     </div>
 
@@ -107,6 +130,9 @@
   </section>
 </div>
 
+<!-- 手机竖屏会话面板遮罩：点击关闭，不参与布局 -->
+<div class="sessions-backdrop" id="sessions-backdrop" aria-hidden="true"></div>
+
 <!-- 介绍网页捕获到文字后的右上角提示（内容已就绪 + 手动复制） -->
 <div class="intro-toast" id="intro-toast" hidden>
   <span class="it-text">内容已就绪：<b id="intro-toast-text"></b></span>
@@ -118,6 +144,6 @@
 <script src="/app/js/pages/renderer.js?v=2"></script>
 <script src="/app/js/pages/theme_manager.js?v=1"></script>
 <script src="/app/js/pages/chat_store.js?v=1"></script>
-<script src="/app/js/pages/chat.js?v=12"></script>
+<script src="/app/js/pages/chat.js?v=16"></script>
 </body>
 </html>

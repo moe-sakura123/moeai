@@ -9,6 +9,8 @@
   const $ = (id) => document.getElementById(id);
   const esc = U.esc;
   const CHAT = '/api/gva/narratium/chatSession/';
+  // 左栏收展状态统一走这里，避免 localStorage 键名散落
+  const SIDE_COLLAPSE_KEY = 'chat.sideCollapsed';
 
   const state = {
     charId: '',
@@ -872,6 +874,7 @@
 
   function selectSession(sid) {
     if (!sid) return Promise.resolve(false);
+    setSessionsOpen(false);
     state.sessionId = sid;
     resetIntroActions();
     renderSessions();
@@ -916,6 +919,8 @@
         statusItems: Array.isArray(m.status) ? m.status : null,
         statusValues: (T.isObj(m.statusValues) ? m.statusValues : null),
         options: Array.isArray(m.options) ? m.options : null,
+        // 后端 messagesOptimized 回填的聊天 CG（刷新后仍挂在对应回复下方）
+        cgImages: Array.isArray(m.cgImages) ? m.cgImages : null,
         createdAt: T.str(m.createdAt),
       }));
       renderMessages();
@@ -1356,6 +1361,8 @@
       // 记忆区摘要由后端自动维护并读库注入，前端不用再传
       const customs = customList().filter((it) =>
         it && it.enabled !== false && String(it.content || '').trim());
+      // 后端 error 帧的真实原因：收尾时若一个字都没收到，就写进气泡而不是通用占位
+      let streamErr = '';
       // 本次回复的流式解析器由 ChatStream 持有：它决定什么时候解析、什么时候重绘
       state.stream = App.sse.streamChat(CHAT + 'chatStream', {
         sessionId: sid,
@@ -1474,14 +1481,18 @@
           }
         },
         onError(err) {
-          U.toast(err.message || '生成失败', false);
+          streamErr = (err && err.message) || '生成失败';
+          U.toast(streamErr, false);
         },
         onClose(reason) {
           if (reason === 'stopped') {
             const draft = state.messages.find((m) => m.draft);
             if (draft && !draft.content) draft.content = '（已停止生成）';
+            finish('');
+            return;
           }
-          finish(reason === 'stopped' ? '' : '');
+          // 一个正文分片都没收到时，用后端 error 帧的原因代替「没有收到回复」通用占位
+          finish(streamErr);
         },
       });
     });
@@ -1566,6 +1577,115 @@
         U.toast('已删除所选对话');
       });
     });
+  }
+
+  /* ---------------------------------------------------------- 左栏收展 */
+  function setSideCollapsed(collapsed) {
+    document.body.classList.toggle('side-collapsed', !!collapsed);
+    const btn = $('btn-side-toggle');
+    if (btn) {
+      const label = collapsed ? '展开侧栏' : '收起侧栏';
+      btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      btn.setAttribute('aria-label', label);
+      btn.title = label;
+    }
+  }
+
+  function initSideToggle() {
+    // 首次访问默认展开；刷新后按本地存储保持
+    setSideCollapsed(S.get(SIDE_COLLAPSE_KEY, 0) === 1);
+    const btn = $('btn-side-toggle');
+    if (!btn) return;
+    btn.addEventListener('click', () => {
+      // 竖屏：同一个圆形箭头按钮改为唤出/收起会话浮层，不改变桌面收展状态
+      if (isPortrait()) {
+        setSessionsOpen(!document.body.classList.contains('sessions-open'));
+        return;
+      }
+      const collapsed = !document.body.classList.contains('side-collapsed');
+      setSideCollapsed(collapsed);
+      S.set(SIDE_COLLAPSE_KEY, collapsed ? 1 : 0);
+    });
+  }
+
+  /* ---------------------------------------------------- 手机会话面板（竖屏） */
+  function isPortrait() {
+    return !!(window.matchMedia &&
+      window.matchMedia('(max-width: 900px) and (orientation: portrait)').matches);
+  }
+
+  function setSessionsOpen(open) {
+    const mq = window.matchMedia ? window.matchMedia('(max-width: 900px) and (orientation: portrait)') : null;
+    const on = !!open && (!mq || mq.matches);
+    document.body.classList.toggle('sessions-open', on);
+    const btn = $('btn-sessions');
+    if (btn) {
+      btn.setAttribute('aria-expanded', on ? 'true' : 'false');
+      btn.setAttribute('aria-label', on ? '关闭会话面板' : '打开会话面板');
+    }
+    // 竖屏复用的圆形箭头按钮：展开后箭头朝左（收起方向），同步无障碍状态
+    const tgl = $('btn-side-toggle');
+    if (tgl && mq && mq.matches) {
+      const label = on ? '收起会话面板' : '展开会话面板';
+      tgl.setAttribute('aria-expanded', on ? 'true' : 'false');
+      tgl.setAttribute('aria-label', label);
+      tgl.title = label;
+    }
+    const bd = $('sessions-backdrop');
+    if (bd) bd.setAttribute('aria-hidden', on ? 'false' : 'true');
+    if (on) {
+      // 与右上角 ☰ 导航抽屉互斥，避免两套浮层同时展开
+      document.body.classList.remove('nav-open');
+      const menu = $('chat-menu-btn');
+      if (menu) {
+        menu.setAttribute('aria-expanded', 'false');
+        menu.setAttribute('aria-label', '打开导航菜单');
+      }
+    }
+  }
+
+  function initSessionsPanel() {
+    const btn = $('btn-sessions');
+    if (btn) {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        setSessionsOpen(!document.body.classList.contains('sessions-open'));
+      });
+    }
+    const closeBtn = $('btn-sessions-close');
+    if (closeBtn) closeBtn.addEventListener('click', () => setSessionsOpen(false));
+    const bd = $('sessions-backdrop');
+    if (bd) bd.addEventListener('click', () => setSessionsOpen(false));
+    // 打开全站导航时收起会话面板（两者互斥）
+    const menu = $('chat-menu-btn');
+    if (menu) menu.addEventListener('click', () => setSessionsOpen(false));
+    // 点面板与触发按钮以外的区域关闭
+    document.addEventListener('click', (e) => {
+      if (!document.body.classList.contains('sessions-open')) return;
+      const t = e.target;
+      if (t instanceof Element && t.closest('.chat-side, #btn-sessions, #btn-side-toggle, #chat-menu-btn')) return;
+      setSessionsOpen(false);
+    });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') setSessionsOpen(false); });
+    // 竖屏切横屏 / 断点变化时关闭，并把圆形按钮的 aria 还原成桌面收展语义
+    const mq = window.matchMedia ? window.matchMedia('(max-width: 900px) and (orientation: portrait)') : null;
+    if (mq) {
+      const off = () => {
+        if (mq.matches) return;
+        setSessionsOpen(false);
+        const tgl = $('btn-side-toggle');
+        if (tgl) {
+          const collapsed = document.body.classList.contains('side-collapsed');
+          const label = collapsed ? '展开侧栏' : '收起侧栏';
+          tgl.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+          tgl.setAttribute('aria-label', label);
+          tgl.title = label;
+        }
+      };
+      if (mq.addEventListener) mq.addEventListener('change', off);
+      else if (mq.addListener) mq.addListener(off);
+    }
+    window.addEventListener('orientationchange', () => setSessionsOpen(false));
   }
 
   /* ---------------------------------------------------------- 绑定 / 启动 */
@@ -1717,6 +1837,8 @@
 
   function init() {
     U.mountTopbar('chat');
+    initSideToggle();        // 左栏收展状态先于首屏生效，避免刷新时闪动
+    initSessionsPanel();     // 手机竖屏会话浮层
     applyDisplay();          // 对话设置里的显示偏好（字号/行距等）先行生效
     bind();
     loadModels();

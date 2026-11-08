@@ -54,7 +54,6 @@
 
 /* ------------------------------------------------------------ 试验台 */
 .lab { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
-@media (max-width: 900px) { .lab { grid-template-columns: 1fr; } .guide-split { grid-template-columns: 1fr; } .guide-toc { position: static; } }
 .lab-side { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
 .lab-tabs { display: flex; gap: 4px; }
 .lab-tabs button {
@@ -117,4 +116,20 @@
   display: inline-grid; place-items: center; width: 22px; height: 22px; margin-right: 6px;
   border-radius: 50%; font-size: 12px; font-weight: 700;
   background: rgba(168, 85, 247, .25); border: 1px solid rgba(168, 85, 247, .5); color: #fff;
+}
+
+/* ==================================================== 响应式断点（统一收敛） */
+/* ≤900 只此一处，置于文件末尾以保证覆盖顺序 */
+@media (max-width: 900px) {
+  .lab { grid-template-columns: minmax(0, 1fr); }
+  .guide-split { grid-template-columns: minmax(0, 1fr); }
+  .guide-split > * { min-width: 0; }
+  .guide-toc { position: static; }
+  /* 目录由竖排长列表改为两列，避免在手机上占掉近半屏 */
+  .guide-toc { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2px; }
+  .guide-toc a { min-height: 40px; display: flex; align-items: center; padding-top: 0; padding-bottom: 0; }
+  .guide-sec .panel-body { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .guide-hero .chip, .guide-sec .chip, .guide-hero .btn, .guide-sec .btn, .lab-tabs button {
+    min-height: 40px; display: inline-flex; align-items: center;
+  }
 }

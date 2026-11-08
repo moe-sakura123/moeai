@@ -87,10 +87,11 @@ img { max-width: 100%; }
 
 .split { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 16px; align-items: start; }
 .split.wide-left { grid-template-columns: 320px minmax(0, 1fr); }
-@media (max-width: 980px) { .split, .split.wide-left { grid-template-columns: 1fr; } }
 
-/* 创作页：整屏布局（参照聊天页：左侧作品栏 + 操作区 + 实时预览，面板内部滚动） */
+
+/* 创作页：桌面整屏布局（保持既有 1440×900 视觉）；窄屏改 flex 满屏见 ≤1180 断点 */
 body.page-creation { overflow: hidden; }
+body.page-creation #topbar { flex: 0 0 auto; }
 body.page-creation .page-wrap {
   max-width: none; margin: 0; height: calc(100vh - 52px);
   padding: 12px 18px 14px; display: flex; flex-direction: column; gap: 10px; overflow: hidden;
@@ -154,16 +155,7 @@ body.page-creation #tab-hint { display: none; }
   align-self: flex-end; background: rgba(168, 85, 247, .18); border-color: rgba(168, 85, 247, .45);
 }
 
-@media (max-width: 1180px) {
-  body.page-creation { overflow: auto; }
-  body.page-creation .page-wrap { height: auto; overflow: visible; }
-  body.page-creation .split { grid-template-columns: 1fr; }
-  body.page-creation aside.stack { overflow: visible; }
-  body.page-creation main.stack .panel, body.page-creation .panel-body { overflow: visible; }
-  body.page-creation .work-list { max-height: calc(100vh - 260px); }
-  .creation-main { grid-template-columns: minmax(0, 1fr); }
-  .pv-frame, .pv-frame iframe, .pv-frame .pv-empty { min-height: 340px; }
-}
+
 
 .panel {
   background: linear-gradient(180deg, rgba(38, 38, 62, .78), rgba(28, 28, 48, .78));
@@ -314,9 +306,13 @@ body.page-creation #tab-hint { display: none; }
 .card .foot { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-top: 7px; font-size: 11px; color: var(--muted-2); }
 
 /* ------------------------------------------------------------ 聊天 */
-.chat-shell { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 0; height: calc(100vh - 52px); }
-@media (max-width: 900px) { .chat-shell { grid-template-columns: 1fr; height: auto; } .chat-side { display: none; } }
+.chat-shell {
+  --chat-side-w: 300px;
+  display: grid; grid-template-columns: var(--chat-side-w) minmax(0, 1fr); gap: 0;
+  transition: grid-template-columns 180ms ease;
+}
 .chat-side {
+  position: relative;
   border-right: 1px solid var(--line); background: rgba(24, 24, 44, .72);
   display: flex; flex-direction: column; min-height: 0;
 }
@@ -339,6 +335,43 @@ body.page-creation #tab-hint { display: none; }
 .session-batch-bar .batch-all input { accent-color: #a855f7; cursor: pointer; }
 .tiny.linklike { background: none; border: none; padding: 0; cursor: pointer; font: inherit; color: var(--muted); text-decoration: underline; }
 .tiny.linklike:hover { color: var(--text); }
+
+/* 左栏收展：桌面端收起时侧栏宽度归零（连同分隔线一起消失），内容区占满全宽；
+   按钮在 .chat-main 内，故不随侧栏消失。grid 轨道随 --chat-side-w 变化，消息区同步平滑变宽。 */
+body.page-chat.side-collapsed .chat-shell { --chat-side-w: 0px; }
+body.page-chat.side-collapsed .chat-side { border-right-width: 0; }
+body.page-chat.side-collapsed .chat-side > .char,
+body.page-chat.side-collapsed .chat-side > .panel-head,
+body.page-chat.side-collapsed .chat-side > .side-scroll,
+body.page-chat.side-collapsed .chat-side > #session-batch-bar { display: none; }
+/* 收展按钮：贴在分隔线右侧（内容区一侧）垂直中部，40px 触控区，方向箭头随状态翻转。
+   锚定在 .chat-main 左缘，因此展开/收起两种状态下都停留在分隔线右侧。 */
+.chat-side-toggle,
+.chat-panel-close {
+  position: absolute; z-index: 30;
+  top: 50%; left: 6px; transform: translateY(-50%);
+  width: 40px; height: 40px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 999px; border: 1px solid var(--line-2);
+  background: rgba(36, 36, 58, .92); color: var(--muted);
+  cursor: pointer; -webkit-tap-highlight-color: transparent;
+  transition: color .15s ease, background .15s ease, border-color .15s ease;
+}
+.chat-side-toggle:hover,
+.chat-panel-close:hover { color: var(--text); background: rgba(48, 48, 80, .95); border-color: rgba(168, 85, 247, .55); }
+.chat-side-toggle:focus-visible,
+.chat-panel-close:focus-visible { outline: 2px solid rgba(168, 85, 247, .8); outline-offset: 2px; }
+.chat-side-toggle svg,
+.chat-panel-close svg { transition: transform 180ms ease; }
+.chat-panel-close { display: none; }
+body.page-chat.side-collapsed .chat-side-toggle {
+  color: #fff; background: rgba(168, 85, 247, .22); border-color: rgba(168, 85, 247, .55);
+}
+body.page-chat.side-collapsed .chat-side-toggle svg { transform: rotate(180deg); }
+
+/* 手机竖屏会话面板：触发按钮与遮罩默认不显示，仅竖屏断点启用 */
+.chat-sessions-btn { display: none; }
+.sessions-backdrop { display: none; position: fixed; inset: 0; z-index: 72; background: rgba(0, 0, 0, .55); }
 
 .chat-main { display: flex; flex-direction: column; min-height: 0; position: relative; }
 .chat-titlebar {
@@ -384,6 +417,56 @@ body.page-creation #tab-hint { display: none; }
 .mm-empty { padding: 18px 12px; text-align: center; color: var(--muted); font-size: 12px; }
 .chat-scroll { flex: 1 1 auto; overflow-y: auto; padding: 18px 18px 8px; display: flex; flex-direction: column; gap: 14px; }
 .chat-scroll .empty-center { margin: auto; text-align: center; color: var(--muted); font-size: 13px; }
+
+/* 聊天页满屏分栏：body 锁定视口高度，顶栏定高、chat-shell 吃满剩余高度。
+   原规则 .chat-shell{height:calc(100vh - 52px)} 与顶栏实际高度（约 53~54.5px）不符，
+   会让页面纵向溢出 1~2.5px 从而出现页面级滚动条；这里改为由 body flex 分配高度，
+   chat-shell 不再写死高度，页面自身不滚动，滚动只发生在 .side-scroll / .chat-scroll 内部。 */
+body.page-chat {
+  height: 100vh; min-height: 0; overflow: hidden;
+  display: flex; flex-direction: column;
+}
+body.page-chat > #topbar { flex: 0 0 auto; }
+body.page-chat .chat-shell {
+  flex: 1 1 auto; min-height: 0; height: auto; width: 100%;
+}
+/* 最近对话列表吃满左栏剩余高度并内部滚动，底部不留空条 */
+body.page-chat .side-scroll { flex: 1 1 auto; min-height: 0; }
+body.page-chat .chat-main { min-width: 0; }
+
+/* 竖屏导航按钮：默认不显示，仅竖屏窄屏出现；40px 触控区，固定在安全区内 */
+.chat-menu-btn {
+  display: none; position: fixed; z-index: 90;
+  top: calc(env(safe-area-inset-top, 0px) + 2px);
+  right: calc(env(safe-area-inset-right, 0px) + 8px);
+  width: 40px; height: 40px; padding: 0; align-items: center; justify-content: center;
+  border-radius: 12px; border: 1px solid var(--line-2);
+  background: rgba(30, 30, 52, .9); color: #e2e8f0; cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.chat-menu-btn:hover { background: rgba(48, 48, 80, .95); }
+.chat-menu-btn:focus-visible { outline: 2px solid rgba(168, 85, 247, .8); outline-offset: 2px; }
+.chat-menu-btn[aria-expanded="true"] {
+  background: rgba(168, 85, 247, .3); border-color: rgba(168, 85, 247, .65); color: #fff;
+}
+.cmb-lines { position: relative; display: block; width: 16px; height: 12px; }
+.cmb-lines i {
+  position: absolute; left: 0; top: 0; width: 16px; height: 2px; border-radius: 2px;
+  background: currentColor; transition: transform .18s ease, opacity .15s ease;
+}
+.cmb-lines i:nth-child(2) { top: 5px; }
+.cmb-lines i:nth-child(3) { top: 10px; }
+.chat-menu-btn[aria-expanded="true"] .cmb-lines i:nth-child(1) { transform: translateY(5px) rotate(45deg); }
+.chat-menu-btn[aria-expanded="true"] .cmb-lines i:nth-child(2) { opacity: 0; }
+.chat-menu-btn[aria-expanded="true"] .cmb-lines i:nth-child(3) { transform: translateY(-5px) rotate(-45deg); }
+/* 手机竖屏：顶部导航不占位，「历史会话」栏与「模型选择」栏从屏幕最上沿开始。
+   env(safe-area-inset-top) 给刘海屏/灵动岛留出安全区，避免被遮挡。
+   左栏不再整块占高，压缩成「最近对话」标题 + 一行横向会话chip，消息区拿到最大高度；
+   两栏都在滚动容器外，滑消息时一起保持吸顶，不会错位或互相遮盖。 */
+
+
+/* 手机横屏：保留左右两栏，只压缩左栏角色卡，避免高度塌陷或两栏挤压 */
+
 
 /* 右侧悬浮按钮组（齿轮=对话设置 / 箭头=回底），与源站一致固定在聊天区右侧垂直居中 */
 .chat-float {
@@ -1153,7 +1236,7 @@ book_status item b {
   display: grid; grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
   gap: 24px; align-items: start;
 }
-@media (max-width: 860px) { .base-grid { grid-template-columns: 1fr; } }
+
 .base-label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
 .cover-col { min-width: 0; }
 .cover-drop {
@@ -1258,7 +1341,7 @@ book_status item b {
 }
 .ec-meta { display: flex; align-items: center; gap: 10px; margin-top: 2px; font-size: 11px; color: var(--muted-2); }
 .ec-meta span:first-child { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-@media (max-width: 520px) { .explore-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; } }
+
 
 /* ------------------------------------------------------------ 我的作品 */
 .works-grid {
@@ -1326,11 +1409,11 @@ book_status item b {
   background: rgba(168, 85, 247, .14); border: 1px solid rgba(168, 85, 247, .3);
 }
 .wc-time { font-size: 11px; color: var(--muted-2); }
-@media (max-width: 520px) { .works-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; } }
+
 
 /* ------------------------------------------------------------ 账号管理 */
 .account-grid { display: grid; grid-template-columns: 330px minmax(0, 1fr); gap: 16px; align-items: start; }
-@media (max-width: 980px) { .account-grid { grid-template-columns: 1fr; } }
+
 
 .account-profile { display: flex; flex-direction: column; align-items: center; gap: 7px; padding: 24px 18px; text-align: center; }
 .ac-avatar {
@@ -1368,7 +1451,7 @@ book_status item b {
 .ac-actions .btn { flex: 1 1 0; }
 
 .ac-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 14px; }
-@media (max-width: 640px) { .ac-form-grid { grid-template-columns: 1fr; } }
+
 
 .ac-growth-title { font-size: 14px; }
 .ac-progress {
@@ -1396,7 +1479,7 @@ book_status item b {
 .auth-tabs { margin-bottom: 14px; }
 .auth-tabs button { flex: 1 1 0; }
 .auth-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 12px; }
-@media (max-width: 520px) { .auth-row { grid-template-columns: 1fr; } }
+
 .auth-msg { min-height: 18px; margin: 0; }
 
 
@@ -1553,3 +1636,251 @@ select.cg-num { appearance: none; -webkit-appearance: none; cursor: pointer;
 .cg-check-block { align-items: flex-start; }
 .cg-check-block .cg-check-box { margin-top: 2px; }
 .cg-duo .cg-check-card { flex: 1; }
+
+/* ==================================================== 响应式断点（统一收敛） */
+
+/* 4 档：1180 / 900(+竖屏/横屏) / 640 / 520；同断点只此一处，规则置于文件末尾以保证覆盖顺序 */
+
+@media (max-width: 1180px) {
+    body.page-creation {
+      display: flex; flex-direction: column;
+      height: 100vh; height: 100dvh; overflow: hidden;
+    }
+    body.page-creation .page-wrap {
+      height: auto; flex: 1 1 auto; min-height: 0;
+      overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch;
+    }
+    body.page-creation .split { grid-template-columns: minmax(0, 1fr); flex: 0 0 auto; }
+    body.page-creation aside.stack { overflow: visible; min-width: 0; }
+    body.page-creation main.stack { min-width: 0; overflow: visible; }
+    body.page-creation main.stack .panel, body.page-creation .panel-body { overflow: visible; }
+    body.page-creation .work-list { max-height: 46vh; }
+    .creation-main { grid-template-columns: minmax(0, 1fr); }
+    .pv-frame, .pv-frame iframe, .pv-frame .pv-empty { min-height: 340px; }
+}
+
+@media (max-width: 900px) {
+   .split, .split.wide-left { grid-template-columns: minmax(0, 1fr); }
+   .split > * { min-width: 0; }
+   .base-grid { grid-template-columns: minmax(0, 1fr); }
+   .account-grid { grid-template-columns: minmax(0, 1fr); }
+   .app-brand, .app-nav a, .app-topbar-right a.tag { min-height: 40px; display: inline-flex; align-items: center; }
+   #topbar-logout, #btn-search, .page-head .row .btn, .tabs button { min-height: 40px; }
+   /* 窄屏内容区内的按钮、下拉与输入框统一到 40px 触控高度 */
+   .page-wrap .btn, .page-wrap select.select, .page-wrap input.input { min-height: 40px; }
+   .page-wrap .btn { min-width: 40px; }
+   /* 触控目标补到 40px（仅窄屏生效，桌面密度不变）：
+      弹窗按钮（创作页 CG 弹窗关闭/替换/AI 生成/取消/保存）、聊天消息操作、
+      世界书复选框外层 label（复选框本身尺寸不变） */
+   .modal .btn { min-height: 40px; }
+   .msg-actions button {
+     min-width: 40px; min-height: 40px; padding: 0 6px;
+     display: inline-flex; align-items: center; justify-content: center;
+   }
+   .page-wrap .check { min-height: 40px; }
+   /* Android 软键盘弹起时给聚焦控件留出滚动余量，避免被键盘遮挡 */
+   input, textarea, select { scroll-margin-bottom: 140px; }
+   /* 窄屏手机顶栏统一收进右上角 ☰ 抽屉（见 ≤900 竖屏断点），不再换行堆叠 */
+   .explore-tag { min-height: 40px; display: inline-flex; align-items: center; padding-top: 4px; padding-bottom: 4px; }
+   body.page-creation .work-list { max-height: 40vh; }
+   /* 绘图页窄屏：创作表单先行，账号/模型列表移到图库之后，避免首屏只有模型清单 */
+   body.page-draw .split > aside { order: 2; }
+   /* 提示词快捷键按钮补到 40px 触控高度 */
+   body.page-draw .chips button { min-height: 40px; padding: 6px 12px; }
+   /* chat 满屏高度：dvh 应对安卓地址栏伸缩，visualViewport 高度应对软键盘 */
+   body.page-chat { height: 100vh; height: var(--app-vh, 100dvh); }
+   /* 我的作品：右上角更多操作按钮补到 40px，菜单同步下移避免压住按钮 */
+   .wc-more { width: 40px; height: 40px; font-size: 20px; }
+   .wc-menu { top: 52px; }
+   /* 账号页头像上的更换按钮补到 40px（整圆 96px 本身也可点） */
+   .ac-avatar .ac-upload { min-height: 40px; padding-top: 0; padding-bottom: 0; }
+}
+
+@media (max-width: 900px) and (orientation: portrait) {
+
+    /* 全站统一：右上角 ☰ 按钮呼出固定浮层抽屉（10 个页面共用同一套交互） */
+    body .chat-menu-btn { display: inline-flex; }
+    /* 抽屉盖在内容之上，position:fixed 不占内容高度；展开时按钮变 ✕ */
+    body .app-topbar {
+      display: none; position: fixed; z-index: 80;
+      top: calc(env(safe-area-inset-top, 0px) + 48px);
+      left: calc(env(safe-area-inset-left, 0px) + 8px);
+      right: calc(env(safe-area-inset-right, 0px) + 8px);
+      max-height: calc(var(--app-vh, 100dvh) - env(safe-area-inset-top, 0px) - 64px);
+      flex-wrap: nowrap; flex-direction: column; align-items: stretch; gap: 6px;
+      padding: 10px; overflow-y: auto;
+      border: 1px solid var(--line-2); border-radius: 14px;
+      background: rgba(26, 26, 46, .98);
+      box-shadow: 0 18px 48px rgba(0, 0, 0, .5);
+      backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
+    }
+    body.nav-open .app-topbar { display: flex; }
+    body .app-topbar .app-brand { display: none; }
+    body .app-nav {
+      order: 0; flex: 0 0 auto; flex-wrap: nowrap;
+      flex-direction: column; align-items: stretch; gap: 2px;
+    }
+    body .app-nav a { padding: 10px 12px; border-radius: 8px; text-align: left; }
+    body .app-topbar-right {
+      order: 1; flex: 0 0 auto; margin-left: 0; justify-content: flex-end; gap: 8px;
+      padding-top: 8px; border-top: 1px solid var(--line);
+    }
+    /* 顶栏收起后内容从安全区下方开始，给右上角按钮留出 40px 触控区 */
+    body:not(.page-chat) .page-wrap { padding-top: calc(env(safe-area-inset-top, 0px) + 52px); }
+    body:not(.page-chat) .console-header {
+      padding-top: calc(env(safe-area-inset-top, 0px) + 10px);
+      padding-right: calc(env(safe-area-inset-right, 0px) + 56px);
+    }
+
+    /* 竖屏：侧栏脱离网格（fixed 浮层，关闭时可见宽度为 0），消息区从模型栏之下占满剩余高度；
+       会话列表由圆形箭头按钮或标题栏「会话」按钮呼出 */
+    body.page-chat .chat-shell { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr); }
+    body.page-chat .chat-sessions-btn { display: inline-flex; min-height: 40px; flex: 0 0 auto; }
+    /* 浮层抽屉：fixed 不占布局；transform 200ms 滑入/滑出；关闭后不可聚焦，箭头方向随状态 */
+    body.page-chat .chat-side {
+      display: flex; position: fixed; z-index: 74;
+      top: env(safe-area-inset-top, 0px);
+      left: env(safe-area-inset-left, 0px);
+      width: min(86vw, 320px);
+      height: calc(var(--app-vh, 100dvh) - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+      min-height: 0; gap: 8px; padding: 10px; overflow: hidden;
+      border: 0; border-right: 1px solid var(--line-2); border-radius: 0 14px 14px 0;
+      background: rgba(26, 26, 46, .98);
+      box-shadow: 18px 0 48px rgba(0, 0, 0, .5);
+      backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
+      transform: translateX(calc(-100% - 24px));
+      visibility: hidden; pointer-events: none;
+      transition: transform 200ms ease, visibility 0s linear 200ms;
+    }
+    body.page-chat.sessions-open .chat-side {
+      transform: translateX(0);
+      visibility: visible; pointer-events: auto;
+      transition: transform 200ms ease, visibility 0s linear 0s;
+    }
+    /* 半透明遮罩：低于抽屉（72 < 74），淡入淡出 */
+    body.page-chat .sessions-backdrop {
+      display: block; opacity: 0; visibility: hidden; pointer-events: none;
+      transition: opacity 200ms ease, visibility 0s linear 200ms;
+    }
+    body.page-chat.sessions-open .sessions-backdrop {
+      opacity: 1; visibility: visible; pointer-events: auto;
+      transition: opacity 200ms ease, visibility 0s linear 0s;
+    }
+    /* 浮层右上角圆形箭头收起按钮，与桌面收展按钮同一外观 */
+    body.page-chat .chat-panel-close {
+      display: inline-flex; z-index: 3;
+      top: 8px; right: 8px; left: auto; transform: none;
+    }
+    /* 浮层内保留角色卡；内容超高时卡片与列表各自可滚动 */
+    body.page-chat .chat-side .char {
+      display: flex; flex: 0 1 auto; min-height: 0; max-height: 52%;
+      padding: 10px 58px 10px 12px; gap: 8px; overflow-y: auto;
+    }
+    body.page-chat .chat-side .char img { width: 56px; height: 56px; border-radius: 12px; }
+    body.page-chat .chat-side .char h2 { font-size: 15px; }
+    body.page-chat .chat-side .char p { max-height: 64px; }
+    body.page-chat .chat-side .panel-head { flex: 0 0 auto; padding: 2px 4px 8px; }
+    body.page-chat .side-scroll {
+      flex: 1 1 auto; min-height: 0; height: auto; padding: 2px 4px;
+      flex-direction: column; overflow-y: auto; overflow-x: hidden; gap: 6px;
+    }
+    body.page-chat .side-scroll .session-item,
+    body.page-chat .side-scroll .session-item:only-child { flex: 0 0 auto; width: 100%; min-height: 44px; }
+    body.page-chat #session-batch-bar { flex: 0 0 auto; }
+    /* 桌面端收起状态残留到竖屏时，抽屉内仍要恢复内容 */
+    body.page-chat.side-collapsed .chat-shell { grid-template-columns: 1fr; }
+    body.page-chat.side-collapsed .chat-side > .char,
+    body.page-chat.side-collapsed .chat-side > .panel-head,
+    body.page-chat.side-collapsed .chat-side > .side-scroll,
+    body.page-chat.side-collapsed .chat-side > #session-batch-bar:not([hidden]) { display: flex; }
+    /* 竖屏下收展按钮改为「唤出浮层」：收起时箭头朝右，展开后朝左（收起方向） */
+    body.page-chat .chat-side-toggle { display: inline-flex; }
+    body.page-chat .chat-side-toggle svg { transform: rotate(180deg); }
+    body.page-chat.sessions-open .chat-side-toggle svg { transform: rotate(0deg); }
+
+    /* 窄屏触控目标统一到 40px（菜单按钮已是 40px） */
+    body.page-chat .chat-titlebar .btn,
+    body.page-chat .chat-side .btn,
+    body.page-chat #btn-session-multi { min-height: 40px; }
+    body.page-chat #btn-session-multi { padding: 0 8px; }
+    body.page-chat .composer .btn,
+    body.page-chat .composer .tool-btn { min-height: 40px; }
+    body.page-chat .chat-titlebar .model-pill { min-height: 40px; }
+    /* 长标题单行省略；右侧留 48px 给固定 ☰，避免两个按钮互相压住 */
+    body.page-chat .chat-titlebar { padding: 6px 48px 6px 12px; gap: 6px; }
+    body.page-chat .chat-titlebar > b {
+      flex: 1 1 auto; min-width: 0;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    body.page-chat .chat-titlebar > .row { flex: 0 0 auto; }
+    /* 360 宽下标题曾被右侧控件挤到 1px：隐藏状态字、模型名省略、清空按钮图标化 */
+    body.page-chat .chat-titlebar #chat-state { display: none; }
+    body.page-chat #model-name { max-width: 96px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    body.page-chat #btn-clear { width: 40px; min-width: 40px; padding: 0; font-size: 0; }
+    body.page-chat #btn-clear::before { content: "×"; font-size: 18px; line-height: 1; }
+    /* 手机竖屏消息区：左右留白收窄，AI 白卡内边距收紧，把宽度让给正文 */
+    body.page-chat .chat-scroll { padding: 14px 12px 10px; }
+    body.page-chat .msg.ai > div { padding: 13px 14px; border-radius: 14px; }
+    /* 空闲时收起仅桌面键盘有意义的 Enter 提示行，把高度让给消息；
+       生成中保留「生成中… + 停止生成」，不影响中断操作 */
+    body.page-chat .composer .tools { margin-top: 4px; }
+    body.page-chat .composer .tools:not(:has(#btn-stop:not([hidden]))) { display: none; }
+    body.page-chat .tool-row { margin-bottom: 6px; }
+    /* 底部手势导航安全区，发送按钮不贴边 */
+    body.page-chat .composer { padding: 8px 12px calc(12px + env(safe-area-inset-bottom, 0px)); }
+}
+
+@media (max-width: 900px) and (orientation: landscape) {
+
+    /* 横屏高度有限：顶栏收成单行，导航横向滚动，避免换行占掉 ~45px 内容高度 */
+    .app-topbar, body:not(.page-chat) .app-topbar {
+      flex-wrap: nowrap; padding: 6px 12px; gap: 10px;
+    }
+    .app-nav, body:not(.page-chat) .app-nav {
+      order: 1; flex: 1 1 auto; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none;
+    }
+    .app-nav::-webkit-scrollbar { display: none; }
+    body:not(.page-chat) .app-topbar-right,
+    .app-topbar-right { order: 2; }
+    body:not(.page-chat) .app-brand-text small { display: none; }
+
+    body.page-chat .chat-side .char { padding: 10px 12px; gap: 6px; }
+    body.page-chat .chat-side .char img { width: 48px; height: 48px; border-radius: 10px; }
+    body.page-chat .chat-side .char h2 { font-size: 14px; }
+    body.page-chat .chat-side .char p { display: none; }
+    body.page-chat .chat-side .char .row { gap: 6px; }
+
+    /* 横屏高度紧张：压缩输入区、隐藏 Enter 提示行，把高度让给消息区 */
+    body.page-chat .composer { padding: 8px 12px calc(8px + env(safe-area-inset-bottom, 0px)); }
+    body.page-chat .composer .tools { display: none; }
+    body.page-chat .tool-row { margin-bottom: 6px; }
+    body.page-chat .composer textarea { min-height: 40px; }
+    body.page-chat .chat-titlebar { padding: 7px 12px; }
+    /* 横屏触控目标同样是 40px，顶栏省下的高度用于消息区 */
+    body.page-chat .chat-side .btn,
+    body.page-chat .chat-titlebar .btn,
+    body.page-chat #btn-session-multi,
+    body.page-chat .chat-titlebar .model-pill,
+    body.page-chat .composer .btn,
+    body.page-chat .composer .tool-btn { min-height: 40px; }
+    body.page-chat #btn-session-multi { padding: 0 8px; }
+
+    /* 横屏沿用现有 300px 侧栏：左栏收展只在桌面提供，避免本地存储的收起态把横屏侧栏压没 */
+    body.page-chat .chat-side-toggle { display: none; }
+    body.page-chat.side-collapsed .chat-shell { grid-template-columns: 300px minmax(0, 1fr); }
+    body.page-chat.side-collapsed .chat-side { border-right-width: 1px; }
+    body.page-chat.side-collapsed .chat-side > .char,
+    body.page-chat.side-collapsed .chat-side > .panel-head,
+    body.page-chat.side-collapsed .chat-side > .side-scroll,
+    body.page-chat.side-collapsed .chat-side > #session-batch-bar { display: flex; }
+}
+
+@media (max-width: 640px) {
+   .ac-form-grid { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 520px) {
+   .explore-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+   .works-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+   .auth-row { grid-template-columns: 1fr; }
+}
