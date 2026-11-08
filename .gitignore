@@ -26,6 +26,7 @@ logs/
 
 # ---- 截图与临时产物 ----
 .screenshots/
+screenshots/
 tmp/
 *.tmp
 
