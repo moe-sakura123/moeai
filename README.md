@@ -15,7 +15,6 @@
 ```
 missai_local/
 ├── html/                      前端全部内容
-│   ├── console.html           本地控制台页面（/local/ 使用，深色主题）
 │   ├── app/                   唯一前端：自建原生页（/app/*）
 │   │   ├── *.html             10 个页面：explore / chat / plaza / draw / creation /
 │   │   │                      worldbook / works / account / console / creation-guide
@@ -87,23 +86,23 @@ python server.py 8080     # 指定端口
 | <http://localhost:4173/app/plaza>、`/app/draw` | 创意广场、AI 绘图 |
 | <http://localhost:4173/app/works>、`/app/account` | 我的作品、账户 |
 | <http://localhost:4173/app/creation-guide> | 创作教程（原 `/creation-guide/*`） |
-| <http://localhost:4173/local/> | 本地控制台（**仅管理员**）：数据库 / 访问日志 / 账号 / 积分管理 / 消耗管理 / 规则管理 / 收藏 / 对话 / 图片库 / 模型接入 / 绘图模型 / 内容库 / 创作数据 / 创意广场 |
-| <http://localhost:4173/app/console> | 控制台的自建页版本（同套 `/js/console.js`，同样**仅管理员**） |
+| <http://localhost:4173/app/console> | 本地控制台（**仅管理员**）：数据库 / 访问日志 / 账号 / 积分管理 / 消耗管理 / 规则管理 / 收藏 / 对话 / 图片库 / 模型接入 / 绘图模型 / 内容库 / 创作数据 / 创意广场 |
+| <http://localhost:4173/local/> | 控制台旧地址，302 跳转到 `/app/console`（`/local/api/*` 接口前缀保持不变） |
 | <http://localhost:4173/login> | 线上原站登录页（反代，备用；推荐用页面右上角登录弹窗，见「怎么登录」） |
 
 **控制台只让管理员看**（页面 + 接口 + 侧栏入口，三处同时把关）：
 
 | 未登录 / 普通用户 | 管理员（`role=admin`） |
 |---|---|
-| `/local/` → 控制台登录页（`/local/api/login` 校验账号密码，非管理员回 401） | `/local/` → 控制台页 |
-| `/app/console` → 同样的管理员登录页 | `/app/console` → 控制台页 |
+| `/app/console` → 控制台登录页（`/local/api/login` 校验账号密码，非管理员回 401） | `/app/console` → 控制台页 |
+| `/local/` → 302 到 `/app/console`，同样先出登录页 | `/local/` → 302 到 `/app/console` 的登录后页面 |
 | `/local/api/*` → 401 `{"code":401,"msg":"请先用管理员账号登录"}` | 正常返回数据 |
 | 站点侧栏**没有**「控制台」按钮（注入前先查会话角色） | 侧栏末尾出现「控制台」按钮 |
 
 **控制台入口两条路**：
 
 - **原站代理页**（`/login` 等反代回来的 HTML）：服务端**回包时**在 `</body>` 前注入
-  `<script src="/js/console-entry.js">`，脚本克隆侧栏原有条目、换成 `href=/local/`，
+  `<script src="/app/js/console-entry.js">`，脚本克隆侧栏原有条目、换成 `href=/app/console`，
   并用 MutationObserver 在 React 重渲染后补回。**只有管理员的请求才注入**；
   磁盘上的 HTML **完全不动**，重跑镜像也不会丢（`selftest.py` 会检查）
 - **自建页**（`/app/*`）：顶栏导航自带「控制台」项（`html/app/js/core/ui.js`），
@@ -200,11 +199,10 @@ python selftest.py 4173   # 227 项，全绿输出「通过 227，失败 0」
 
 数据库位置：`data/missai.db`（WAL 模式，多线程安全）。控制台页面直接读 `/local/api/*`。
 
-## 数据库控制台（/local/ 与 /app/console）
+## 数据库控制台（/app/console）
 
-控制台是深色主题的单页应用（与站点统一：深底 + 紫粉 + 少量金），共用
-`html/console.html`（`/local/`，带原站侧栏外壳）与 `html/app/console.html`（`/app/console`，
-自建顶栏版）两份外壳、同一套 `js/console.js` + `css/console.css`。顶部导航：
+控制台是深色主题的单页应用（与站点统一：深底 + 紫粉 + 少量金），页面本体只有
+`html/app/console.html` 一份，搭配 `app/js/console.js` + `app/css/console.css`。顶部导航：
 数据库、访问日志、账号、积分管理、消耗管理、规则管理、收藏、对话、图片库、模型接入、
 绘图模型、内容库、创作数据、创意广场。默认打开「数据库」视图，直接对本地 SQLite 做增删改查。
 
@@ -488,10 +486,9 @@ python selftest.py 4173   # 227 项，全绿输出「通过 227，失败 0」
 | 页面里的引用 | 实际文件 |
 |---|---|
 | `/app/*` 页面 | `html/app/*.html`（10 页白名单，未知页 404；`/app/console` 要管理员） |
-| `/app/{css,js,img,assets}/*` | `html/app/` 下同名路径 |
-| `/js/*`、`/css/*` | `html/js/*`、`html/css/*`（css 会先查 `mirror_assets` 表） |
+| `/app/{css,js,img,assets}/*` | `html/app/` 下同名路径（静态资源只有这一套对外路径） |
 | `/fonts/*` | `html/assets/fonts/*`（本地缺该字体 → 快速 404 走回退字体，不回源挂 90s） |
-| `/logo-goddess1.webp`、`/favicon.svg`、`/res.js` … | `html/assets/*`、`html/js/*`（`ROOT_FILES` 固定表） |
+| `/logo-goddess1.webp`、`/favicon.svg`、`/res.js` … | `html/assets/*`、`html/app/js/*`（`ROOT_FILES` 固定表） |
 | `/image/*`、`/api/uploads/file/*` | **先查 `image.db`** 拿到相对路径并按项目根拼接，再读 `html/image/*` |
 | `/cdn/*`、`/cdn2/*` | 首次抓取 → 落 `html/image/` + 写 `image.db`；之后全走本地 |
 | `/_next/*`（线上页面残留引用） | **已无本地映射**，走反代兜底回源 |
@@ -513,7 +510,7 @@ python selftest.py 4173   # 227 项，全绿输出「通过 227，失败 0」
 | `/api/gva/checkin/status|calendar|sign|reward-config` | **每日签到**全部本地：状态 / 当月日历 / 签到加分 / 奖励配置（见「账户设置与签到」） |
 | `/api/gva/user/getUserInfo`、`user/setSelfInfo`、`user/changeMyPassword` | **账户设置**：个人资料读写、改密码，全部落 `users` 表（见「账户设置与签到」） |
 | `/api/gva/oauth/status`、`oauth/bindings`、`oauth/bind/factors`、`email/getVerificationStatus`、`email/getRewardConfig` | 账户页的绑定/邮箱状态由本地账号推导（未绑 Google → `google:false`，邮箱状态读 `users.email`） |
-| `/local/`、`/local/api/*` | 控制台（`db` / `stats` / `schema` / `logs` / `users` / `sessions` / `favorites` / `chat` / `images` / `works` / `tags` / `content_apis` / `llm` / `image-models` / `templates` …）——**仅管理员**，`POST /local/api/login` 登录 |
+| `/local/`（302 → `/app/console`）、`/local/api/*` | 控制台（`db` / `stats` / `schema` / `logs` / `users` / `sessions` / `favorites` / `chat` / `images` / `works` / `tags` / `content_apis` / `llm` / `image-models` / `templates` …）——**仅管理员**，`POST /local/api/login` 登录 |
 | `POST/PUT/DELETE /api/gva/work*`、`works/my`、`work/creativeRefs`、`workFilter/config`、`llmModelRate/*`、`aiMedia/creator/catalog`、`fileUploadAndDownload/upload` | **创作页**整页读写本地库（见下节） |
 | `narratiumWorldbookEntry/*` | 世界书条目本地增删改查（`data` 必须是数组、`ID` 必须是整数） |
 | `narratium/chatSession/*`、`narratium/guestChat/chatStream` | **聊天界面**：会话、历史、消息、流式回复全部本地（见下节） |
@@ -706,7 +703,7 @@ server**（避免循环依赖）。一次对话按固定顺序走：
 
 ## 模型接入（OpenAI 协议：api + key 入库，聊天真调模型）
 
-控制台左侧「图片库」下面是**「模型接入」**栏目（`/local/` → `view-llm`，仅管理员）。
+控制台左侧「图片库」下面是**「模型接入」**栏目（`/app/console` → `view-llm`，仅管理员）。
 它负责填 **API 地址 + apikey**、存库、连上去检测模型并显示；聊天界面「选择模型」的列表
 与聊天回复都由它驱动。
 
@@ -835,7 +832,7 @@ server**（避免循环依赖）。一次对话按固定顺序走：
 | `POST /api/local/gallery/like` | 点赞 +1 |
 | `POST /api/local/gallery/delete` | 删除（管理员可删任意，普通用户只删自己的） |
 
-**控制台「绘图模型」**（`/local/` → `view-draw`，仅管理员；与聊天「模型接入」完全分开）
+**控制台「绘图模型」**（`/app/console` → `view-draw`，仅管理员；与聊天「模型接入」完全分开）
 
 | 接口 | 作用 |
 |---|---|
@@ -936,7 +933,7 @@ server**（避免循环依赖）。一次对话按固定顺序走：
 
 生成结果的 `assetUrl` 在前端只有「https + 线上白名单域名」算合法，本地产出的 `/image/xxx.png`
 会被判成「生成任务数据不完整」，轮询连续失败 3 次后页面报「暂时无法查询生成进度，任务仍在后台处理中。」。
-`server.py` 启动时把 `html/js` 里那处严格校验换成同一模块导出的宽松版（放行 `/` 开头的相对路径），
+`server.py` 启动时把 `html/app/js` 里那处严格校验换成同一模块导出的宽松版（放行 `/` 开头的相对路径），
 内容没变就不写盘，重启多少次都安全。
 
 **日后加绘图模型**：能跑 `GET /models` + `POST /images/generations` 的服务，
@@ -954,12 +951,12 @@ server**（避免循环依赖）。一次对话按固定顺序走：
 
 | 脚本 | 注入给谁 | 作用 |
 |---|---|---|
-| `html/js/no-feed-cache.js` | 所有人 | 关掉原站首页 feed 的 localStorage 快照缓存（不带 defer，在站点 chunk 执行前截断读写），页面直读本地库 |
-| `html/js/hide-ads.js` | 所有人 | 隐藏登录后的促销广告轮播条：插一条 CSS（`display:none !important`）+ 按促销文案给节点打 `data-local-ad`，**不删 DOM**，不和 React 抢节点 |
-| `html/js/fault-tolerance.js` | 所有人 | 内容接口 502/失败时改写为空成功，页面渲染空态而非无限加载 |
-| `html/js/empty-cleaner.js` | 所有人 | 登录态空数据区块（如热力橱窗）骨架占位改为「暂无内容」空态 |
-| `html/js/publish-jump.js` | 所有人 | 创作页发布成功后自动跳回作品列表刷新（只在 `/creation` 编辑页触发） |
-| `html/js/console-entry.js` | **仅管理员** | 在左侧导航栏加「控制台」入口（`data-local-console-entry`），点开进 `/local/` |
+| `html/app/js/no-feed-cache.js` | 所有人 | 关掉原站首页 feed 的 localStorage 快照缓存（不带 defer，在站点 chunk 执行前截断读写），页面直读本地库 |
+| `html/app/js/hide-ads.js` | 所有人 | 隐藏登录后的促销广告轮播条：插一条 CSS（`display:none !important`）+ 按促销文案给节点打 `data-local-ad`，**不删 DOM**，不和 React 抢节点 |
+| `html/app/js/fault-tolerance.js` | 所有人 | 内容接口 502/失败时改写为空成功，页面渲染空态而非无限加载 |
+| `html/app/js/empty-cleaner.js` | 所有人 | 登录态空数据区块（如热力橱窗）骨架占位改为「暂无内容」空态 |
+| `html/app/js/publish-jump.js` | 所有人 | 创作页发布成功后自动跳回作品列表刷新（只在 `/creation` 编辑页触发） |
+| `html/app/js/console-entry.js` | **仅管理员** | 在左侧导航栏加「控制台」入口（`data-local-console-entry`），点开进 `/local/` |
 
 > 早期的 `gallery-link.js`（把侧边栏「AI绘图」改指本地）**已删除、不再注入** ——
 > 旧镜像页下线后侧栏入口保持原站链接，由 302 表接管。
@@ -1007,7 +1004,7 @@ curl -X POST http://localhost:4173/api/gva/user/register_and_login \
 ## 重建镜像
 
 ```bash
-# 1) 静态镜像：抓取首页 HTML + 全部静态资源，覆盖 html/（含 html/js、html/css）
+# 1) 静态镜像：抓取首页 HTML + 全部静态资源，覆盖 html/（含 html/app/js、html/app/css）
 python tools/mirror.py
 
 # 2) 手动镜像落库：按数据面分页抓原站接口，回包拆进内容库（进度写 config_cache）
@@ -1036,6 +1033,8 @@ python tools/mirror.py sync 60 [账号] [密码]      # 创意广场同步
   不是服务端故障（以前会被记成 500 `ConnectionAbortedError`）；服务端 listen 队列已提到 128，
   并发刷新不会再出现 `ConnectionRefused`。
 - `/res.js`、`/legacy-polyfills.js` 目前没有页面引用，保留在 `ROOT_FILES` 里暂未清理。
+- 历史静态路径 `/js/*`、`/css/*` 已彻底下线（不再提供兼容别名），命中即 404；
+  样式与脚本只走 `/app/css/*`、`/app/js/*`。
 - 聊天页刷新后若曾出现白色大块 + 左上角「正文」，根因见上一章「刷新后聊天区变白色大块」，
   已修复（过期 sessionId 兜底 + chatSession 子路由全本地化 + `read_body()` 可重复读）。
 - 登录/支付等真实交易最终仍由线上后端处理，本地只负责账号、日志、收藏、对话与展示。
