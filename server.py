@@ -15,6 +15,7 @@ server.py — 本地运行镜像站点（纯 Python 标准库，无第三方依�
 """
 
 import hashlib
+import html
 import http.client
 import json
 import math
@@ -59,13 +60,19 @@ CDN2 = "https://images.comfyai.site"
 
 ROOT = Path(__file__).resolve().parent
 HTML_DIR = ROOT / "html"
-JS_DIR = HTML_DIR / "js"          # 前端脚本：html/js
-CSS_DIR = HTML_DIR / "css"        # 前端样式：html/css
+APP_DIR = HTML_DIR / "app"        # 唯一前端：自建原生页（/app/*）
+JS_DIR = APP_DIR / "js"           # 前端脚本：html/app/js（对外只走 /app/js/*）
 IMAGE_DIR = HTML_DIR / "image"    # 图片：html/image（统一落盘 + 进 image.db）
 ASSET_DIR = HTML_DIR / "assets"
-APP_DIR = HTML_DIR / "app"        # 唯一前端：自建原生页（/app/*）
-APP_PAGES = ("creation", "worldbook", "chat", "plaza", "draw", "console", "explore", "works",
-             "account", "creation-guide")
+
+# 页面名 → 文件由目录扫描 + 名称白名单决定，不再维护逐页路由表。
+# 页面名只允许小写字母 / 数字 / 下划线 / 连字符（不含点、斜杠、百分号），
+# 从根上排除 ../、绝对路径、反斜杠与 %2e 编码绕过；再叠加 page_target 的目录校验。
+PAGE_NAME_RE = re.compile(r"^[a-z0-9_-]{1,64}$")
+# 根级页面（/<name> → html/<name>.html）不与这些一级路径抢命名空间
+ROOT_PAGE_RESERVED = frozenset({
+    "app", "api", "local", "js", "css", "img", "assets", "cdn", "cdn2", "html",
+})
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 4173
 
@@ -551,6 +558,21 @@ def safe(base: Path, rel: str) -> Path | None:
     return target if str(target).startswith(str(base.resolve())) and target.is_file() else None
 
 
+def page_target(base: Path, name: str) -> Path | None:
+    """页面名 → base/<name>.html。
+
+    只接受单段白名单名称，并且要求解析后的绝对路径**恰好**落在 base 目录内
+    （父目录必须等于 base），因此 `<name>.html` 之外的文件、子目录与穿越路径
+    全部拒绝；文件不存在也返回 None（未知名称交给调用方回 404）。
+    """
+    if not PAGE_NAME_RE.match(name):
+        return None
+    target = safe(base, name + ".html")
+    if target is None or target.parent != base.resolve():
+        return None
+    return target
+
+
 def rewrite(text: str) -> str:
     """把响应体里的跨域绝对地址改写成本地路径（图片走 /cdn 反代，接口走同源）"""
     return (text
@@ -575,14 +597,14 @@ def _rewrite_imgs(obj) -> None:
                 _rewrite_imgs(v)
 
 
-CONSOLE_ENTRY_TAG = '<script src="/js/console-entry.js" defer></script>'
-HIDE_ADS_TAG = '<script src="/js/hide-ads.js" defer></script>'
-FAULT_TOLERANCE_TAG = '<script src="/js/fault-tolerance.js"></script>'
-EMPTY_CLEANER_TAG = '<script src="/js/empty-cleaner.js"></script>'
-PUBLISH_JUMP_TAG = '<script src="/js/publish-jump.js"></script>'
+CONSOLE_ENTRY_TAG = '<script src="/app/js/console-entry.js" defer></script>'
+HIDE_ADS_TAG = '<script src="/app/js/hide-ads.js" defer></script>'
+FAULT_TOLERANCE_TAG = '<script src="/app/js/fault-tolerance.js"></script>'
+EMPTY_CLEANER_TAG = '<script src="/app/js/empty-cleaner.js"></script>'
+PUBLISH_JUMP_TAG = '<script src="/app/js/publish-jump.js"></script>'
 # 探索页首页 feed 缓存屏蔽：不带 defer，保证在站点 chunk（defer/模块）执行前
 # 就把 localStorage 的 missai:home-feed:* 读写截断掉，页面直读本地库
-NO_FEED_CACHE_TAG = '<script src="/js/no-feed-cache.js"></script>'
+NO_FEED_CACHE_TAG = '<script src="/app/js/no-feed-cache.js"></script>'
 
 
 def inject_local_scripts(html: str, admin: bool) -> str:
@@ -813,7 +835,7 @@ class Handler(BaseHTTPRequestHandler):
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>控制台登录 · MissAI 镜像</title>
-  <link rel="stylesheet" href="/css/console.css">
+  <link rel="stylesheet" href="/app/css/console.css">
 </head>
 <body>
   <div id="local-console-login" class="login-box">
@@ -1700,6 +1722,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 works = db.list_image_works(sort, limit, offset)
                 total = db.count_image_works()
+            base_charge = db.image_charge(1)
             return self.send_json({
                 "code": 0,
                 "data": {
@@ -1710,15 +1733,22 @@ class Handler(BaseHTTPRequestHandler):
                     "providers": len(db.list_image_providers()),
                     "points": db.points_balance(sess["id"]) if sess else None,
                     "mine": mine,
+                    **db.image_size_table(),
+                    "charge": {"pointsPerImage": base_charge["perImage"],
+                               "freeLocal": base_charge["freeLocal"]},
                 },
             })
 
         if path == "/api/local/gallery/models" and self.command in ("GET", "HEAD"):
+            base_charge = db.image_charge(1)
             return self.send_json({"code": 0, "data": {
                 "models": db.image_rate_models(),
                 "presets": [{"key": k, "label": v.get("label"),
                              "sizes": v.get("sizes")} for k, v in db.IMAGE_PRESETS.items()],
                 "me": me,
+                **db.image_size_table(),
+                "charge": {"pointsPerImage": base_charge["perImage"],
+                           "freeLocal": base_charge["freeLocal"]},
             }})
 
         body = self._json_body()
@@ -1926,7 +1956,20 @@ class Handler(BaseHTTPRequestHandler):
                                        "data": None}, status=401)
             prompt = str(body.get("prompt") or "").strip()
             negative = str(body.get("negative") or "").strip()
-            size = str(body.get("size") or "1024x1024")
+            # 官方语义：size 收档位（1K/2K/3K/4K），ratio 收比例（1:1、16:9…）；
+            # 旧客户端传像素时由 db.image_size_lookup 反查表内组合。
+            size = str(body.get("size") or "").strip()
+            ratio = str(body.get("ratio") or "").strip()
+            tier = str(body.get("tier") or "").strip()
+            # 自定义宽高：前端传 ratio="custom" + width/height；也兼容不传 ratio 只传宽高
+            try:
+                custom_w = int(body.get("width") or 0)
+                custom_h = int(body.get("height") or 0)
+            except (TypeError, ValueError):
+                return self.send_json({"code": 1, "msg": "自定义宽高必须是整数",
+                                       "data": {"error": "size_invalid"}})
+            custom_size = (ratio.lower() == "custom"
+                           or (bool(custom_w or custom_h) and not ratio and not size))
 
             # 选了模板：按模板 schema 校验字段并生成最终提示词（忽略前端传来的 prompt）
             recipe_key = str(body.get("recipeKey") or "").strip()
@@ -1940,7 +1983,11 @@ class Handler(BaseHTTPRequestHandler):
                 conf = recipe.get("local") if isinstance(recipe.get("local"), dict) else {}
                 if not negative:
                     negative = str(conf.get("negative") or "")
+                # 模板自带 aspectRatio → 用旧像素值反查数据库尺寸表，不另设比例下拉
                 size = mediagen.pick_size(recipe, fields)
+                ratio = ""
+                tier = ""
+                custom_size = False           # 模板尺寸由模板决定，忽略自定义宽高
                 if not prompt:
                     return self.send_json({"code": 1, "msg": "请先填写模板要求的内容",
                                            "data": None})
@@ -1955,57 +2002,118 @@ class Handler(BaseHTTPRequestHandler):
                 seed = max(0, min(2147483647, int(body.get("seed") or 0)))
             except (TypeError, ValueError):
                 seed = 0
+            dry_run = bool(body.get("dryRun"))
 
-            # 1) 页面选了具体模型 → 用它；2) 否则用默认接入；3) 都没有 → 本地占位图
-            target = db.resolve_image_rate_id(body.get("rateId"))
+            if custom_size:
+                size_row, size_err = db.image_size_custom(custom_w, custom_h)
+            else:
+                if not size and not ratio:
+                    size, ratio = "1K", "1:1"     # 旧客户端未传尺寸时的显式默认
+                size_row, size_err = db.image_size_lookup(size, ratio, tier)
+            if not size_row:
+                return self.send_json({"code": 1, "msg": size_err, "data": {
+                    "error": "size_invalid", "size": size, "ratio": ratio,
+                    "tier": tier, "width": custom_w, "height": custom_h,
+                }})
+
+            # 1) 显式选了本地占位 → 走本地；2) 选了具体模型 → 用它；
+            # 3) 否则用默认接入；4) 都没有 → 本地占位图
+            try:
+                want_rid = int(body.get("rateId") or 0)
+            except (TypeError, ValueError):
+                want_rid = 0
             base = key = ""
             provider_id = None
             provider_name = "本地占位绘图"
             model = "local-placeholder"
             local = True
-            if target:
-                row, model = target
-                if str(row.get("kind") or "") == "local" or str(row.get("base_url") or "").startswith("local://"):
-                    local = True
-                    provider_id = int(row["id"])
-                    provider_name = str(row["name"] or "")
-                else:
-                    cred = db.image_credentials(row["id"]) or ("", "")
-                    base, key = cred
-                    provider_id = int(row["id"])
-                    provider_name = str(row["name"] or "")
-                    local = False
+            if want_rid == db.LOCAL_IMAGE_RATE_ID:
+                provider_id = 0
             else:
-                endpoint = db.active_image_endpoint()
-                if endpoint:
-                    base, key, model, _sizes = endpoint
-                    prov = db.one("SELECT id, name, kind, base_url FROM image_providers"
-                                  " WHERE enabled=1 ORDER BY is_default DESC, id ASC")
-                    provider_id = int(prov["id"]) if prov else None
-                    provider_name = str((prov or {}).get("name") or "")
-                    local = (str((prov or {}).get("kind") or "") == "local"
-                             or str(base or "").startswith("local://"))
+                target = db.resolve_image_rate_id(want_rid)
+                if target:
+                    row, model = target
+                    if str(row.get("kind") or "") == "local" or str(row.get("base_url") or "").startswith("local://"):
+                        local = True
+                        provider_id = int(row["id"])
+                        provider_name = str(row["name"] or "")
+                    else:
+                        cred = db.image_credentials(row["id"]) or ("", "")
+                        base, key = cred
+                        provider_id = int(row["id"])
+                        provider_name = str(row["name"] or "")
+                        local = False
+                else:
+                    endpoint = db.active_image_endpoint()
+                    if endpoint:
+                        base, key, model, _sizes = endpoint
+                        prov = db.one("SELECT id, name, kind, base_url FROM image_providers"
+                                      " WHERE enabled=1 ORDER BY is_default DESC, id ASC")
+                        provider_id = int(prov["id"]) if prov else None
+                        provider_name = str((prov or {}).get("name") or "")
+                        local = (str((prov or {}).get("kind") or "") == "local"
+                                 or str(base or "").startswith("local://"))
 
-            bill = db.image_charge(n, local=local)
+            # 上游没有 negative 字段：把排除语义并入 prompt，保证反向提示词真的生效
+            final_prompt = prompt
+            if negative and not local:
+                final_prompt = prompt + "\n避免出现：" + negative
+
+            bill = db.image_charge(n, local=local, points=size_row.get("points"))
             balance_before = db.points_balance(sess["id"])
+            size_echo = {
+                "size": size_row["pixels"], "pixels": size_row["pixels"],
+                "width": int(size_row["width"]), "height": int(size_row["height"]),
+                "ratio": str(size_row["ratio"]), "tier": str(size_row["tier"]),
+                "sizeId": int(size_row["id"]),
+                # 自定义宽高：请求值 / 实际值 / 是否归一化，全部显式回传
+                "requestedPixels": str(size_row.get("requestedPixels") or size_row["pixels"]),
+                "actualPixels": str(size_row.get("actualPixels") or size_row["pixels"]),
+                "normalized": bool(size_row.get("normalized")),
+                "custom": bool(custom_size),
+            }
+            if custom_size:
+                size_echo["aspectDeviation"] = float(size_row.get("aspectDeviation") or 0)
+                size_echo["aspectWarning"] = bool(size_row.get("aspectWarning"))
+            if dry_run:
+                # 只回预览（最终提示词 + 费用/余额），不生成、不落库、不扣分。
+                # 绘图页不传 dryRun，行为不变；创作页 AI CG 用它做点击前校验。
+                return self.send_json({"code": 0, "msg": "预览", "data": {
+                    "prompt": final_prompt, "negative": negative, "n": n,
+                    "cost": bill["total"], "pointsPerImage": bill["perImage"],
+                    "balance": balance_before,
+                    "canAfford": bill["total"] <= 0 or balance_before >= bill["total"],
+                    "local": local, "model": model, "providerName": provider_name,
+                    **size_echo,
+                }})
             if bill["total"] > 0 and balance_before < bill["total"]:
                 return self.send_json({
                     "code": 1,
                     "msg": (f"积分不足：生成 {n} 张需要 {bill['total']} 积分，"
                             f"当前余额 {balance_before}。可在账号中心签到或联系管理员充值。"),
                     "data": {"need": bill["total"], "balance": balance_before,
-                             "pointsPerImage": bill["perImage"]},
+                             "pointsPerImage": bill["perImage"], **size_echo},
                 })
 
             try:
                 if local:
-                    images = [imagegen.placeholder_png(prompt, size, seed) for _ in range(n)]
+                    images = [imagegen.placeholder_png(
+                        final_prompt, size_row["tier"], seed,
+                        width=int(size_row["width"]),
+                        height=int(size_row["height"])) for _ in range(n)]
                 else:
-                    images = imagegen.generate(base, key, model, prompt, negative, size, n,
-                                               seed=seed)
+                    images = imagegen.generate(
+                        base, key, model, final_prompt, negative, n=n, seed=seed,
+                        size=size_row["tier"], ratio=size_row["ratio"],
+                        width=int(size_row["width"]),
+                        height=int(size_row["height"]),
+                        tier=size_row["tier"])
             except imagegen.ImageGenError as exc:
                 db.db_log("IMAGE_GENERATE_FAIL", "image_works",
-                          json.dumps({"model": model, "error": str(exc)[:300]},
+                          json.dumps({"model": model, "size": size_row["pixels"],
+                                      "ratio": size_row["ratio"],
+                                      "tier": size_row["tier"],
+                                      "error": str(exc)[:300]},
                                      ensure_ascii=False), sess.get("id"))
                 return self.send_json({"code": 1, "msg": str(exc), "data": None})
 
@@ -2025,19 +2133,21 @@ class Handler(BaseHTTPRequestHandler):
                 url_key = f"/image/{name}"
                 row = imagedb.register(url_key, target_file, "ai")
                 work = db.add_image_work(
-                    sess.get("id"), author, prompt, negative,
-                    provider_id, provider_name, model, size, url_key,
+                    sess.get("id"), author, final_prompt, negative,
+                    provider_id, provider_name, model, size_row["pixels"], url_key,
                     (row or {}).get("id"), seed=seed)
                 if work:
                     works.append(work)
                     if bill["perImage"] > 0:
                         db.log_consumption(sess.get("id"), "image", str(work.get("id")),
-                                           prompt[:60], "image", 0, bill["perImage"])
+                                           final_prompt[:60], "image", 0, bill["perImage"])
             points_deducted = min(bill["total"], balance_before)
             if points_deducted > 0:
                 db.add_points(sess["id"], -points_deducted)
             db.db_log("IMAGE_GENERATE", "image_works",
-                      json.dumps({"model": model, "size": size, "n": len(works),
+                      json.dumps({"model": model, "size": size_row["pixels"],
+                                  "ratio": size_row["ratio"],
+                                  "tier": size_row["tier"], "n": len(works),
                                   "points": points_deducted}, ensure_ascii=False),
                       sess.get("id"))
             self._note = "ai-generate"
@@ -2047,7 +2157,9 @@ class Handler(BaseHTTPRequestHandler):
                 "data": {"works": works, "local": local, "model": model,
                          "pointsDeducted": points_deducted,
                          "pointsPerImage": bill["perImage"],
-                         "balance": db.points_balance(sess["id"])},
+                         "balance": db.points_balance(sess["id"]),
+                         "prompt": final_prompt,
+                         **size_echo},
             })
 
         if path == "/api/local/gallery/like" and self.command == "POST":
@@ -2660,26 +2772,6 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(msg)
         self._note = "empty-db"
-
-    def _css_from_db(self, path: str, rel: str) -> bool:
-        """样式入库：库里命中就从数据库出（带长缓存），否则回文件"""
-        got = db.asset_get(path)
-        if not got:
-            got = db.asset_get("/css/" + rel) or db.asset_get("/_next/static/css/" + rel)
-        if not got:
-            return False
-        data, ctype = got
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "public, max-age=86400")
-        self.send_header("X-Local", "db-asset")
-        self.end_headers()
-        try:
-            self.wfile.write(data)
-        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
-            return True
-        return True
 
     # ================================================== 路由
     # ================================================== 创作页 / 聊天（本地库读写）
@@ -4415,8 +4507,15 @@ class Handler(BaseHTTPRequestHandler):
                                   text=self._local_reply(name, message))
         return StreamDecision(
             fatal=True, src="chat-llm-failed",
-            error=(f"模型回复失败：{exc}"
-                   "（未自动切换本地模式，可在控制台「模型接入」开启超时回退）"))
+            error=(self._stream_error_text(exc)))
+
+    @staticmethod
+    def _stream_error_text(exc: Exception) -> str:
+        """上游错误 → 用户可读文案：429 是免费额度限流，不把整段 JSON 抛给前端。"""
+        if isinstance(exc, llm.LLMError) and exc.status == 429:
+            return "上游模型限流（免费额度已用尽，HTTP 429），请稍后重试"
+        return (f"模型回复失败：{exc}"
+                "（未自动切换本地模式，可在控制台「模型接入」开启超时回退）")
 
     @staticmethod
     def _inject_custom(msgs: list[dict], payload: dict,
@@ -4849,6 +4948,211 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[memory] 向量补算完成 {done} 条（模型 {model_id}）", file=sys.stderr)
         return done
 
+    def _image_endpoint_info(self) -> tuple:
+        """绘图接入：默认接入优先，没有就本地占位（与绘图页一致）。"""
+        base = key = ""
+        model = "local-placeholder"
+        provider_name = "本地占位绘图"
+        local = True
+        endpoint = db.active_image_endpoint()
+        if endpoint:
+            base, key, model, _sizes = endpoint
+            prov = db.one("SELECT name, kind, base_url FROM image_providers"
+                          " WHERE enabled=1 ORDER BY is_default DESC, id ASC")
+            provider_name = str((prov or {}).get("name") or "")
+            local = (str((prov or {}).get("kind") or "") == "local"
+                     or str(base or "").startswith("local://"))
+        return base, key, model, provider_name, local
+
+    @staticmethod
+    def _stat_rule(file_name: str) -> dict:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "data", "rules", file_name)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:                            # noqa: BLE001
+            return {}
+
+    @staticmethod
+    def _stat_emotion_text(file_name: str, value: float) -> str:
+        """把状态数值按规则档位翻成情绪描述（如 好感度 42 → 略有亲近感）。"""
+        rule = Handler._stat_rule(file_name)
+        for r in (rule.get("rules") or []):
+            m = re.match(r"^\s*(-?\d+)\s*~\s*(-?\d+)\s*$", str(r.get("range") or ""))
+            if not m:
+                continue
+            lo, hi = int(m.group(1)), int(m.group(2))
+            if lo <= value <= hi:
+                return str(r.get("emotion") or "")
+        return ""
+
+    @staticmethod
+    def _plain_text(raw, limit: int = 0) -> str:
+        """富文本 → 纯文本：去掉 style/script 与标签、解实体、压空白，可截断。
+
+        角色卡 description 是 HTML 富文本，直接进绘图提示词会把整段标签
+        喂给模型，这里统一清洗后再用。
+        """
+        txt = str(raw or "")
+        txt = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", txt, flags=re.S | re.I)
+        txt = re.sub(r"<br\s*/?>|</(p|div|li|h\d)>", " ", txt, flags=re.I)
+        txt = re.sub(r"<[^>]+>", " ", txt)
+        txt = re.sub(r"\s+", " ", html.unescape(txt)).strip()
+        return txt[:limit] if limit > 0 else txt
+
+    def _chat_cg_defaults(self, uid, sid: str) -> dict | None:
+        """聊天页生成 CG 的自动取值：角色外观 / 场景 / 情绪 / 动作状态。"""
+        thread = db.one("SELECT id, character_id, character_name FROM chat_threads"
+                        " WHERE user_id IS ? AND session_id=?", (uid, sid))
+        if not thread:
+            return None
+        cid = str(thread["character_id"] or "")
+        name = str(thread["character_name"] or "")
+        ch = db.work_as_character(db.find_work(cid) or {}) if cid else {}
+        appearance = Handler._plain_text(ch.get("description"), 200)
+        scene = Handler._plain_text(ch.get("summary"), 80)
+        role = (name + "：" if name else "") + appearance
+
+        last = db.one("SELECT id, content FROM chat_messages WHERE thread_id=?"
+                      " AND role!='user' ORDER BY id DESC LIMIT 1",
+                      (int(thread["id"]),))
+        values, say = {}, ""
+        if last:
+            parsed = process_output(last["content"] or "", None, True)
+            values = status_dict(parsed.get("status") or []) or {}
+            for seg in re.findall(r"<say>(.*?)</say>", last["content"] or "", re.S):
+                if seg.strip():
+                    say = Handler._plain_text(seg, 80)
+        emo = []
+        for stat, fname in (("好感度", "affection_rules.json"),
+                            ("SAN值", "san_rules.json")):
+            if stat not in values:
+                continue
+            try:
+                v = float(values[stat])
+            except (TypeError, ValueError):
+                continue
+            txt = Handler._stat_emotion_text(fname, v)
+            emo.append(f"{stat} {int(v)}" + (f"（{txt}）" if txt else ""))
+        nums = "、".join(f"{k} {values[k]}" for k in values)
+        action = say[:80]
+        if nums:
+            action = (action + "；" if action else "") + "当前数值：" + nums
+        return {"threadId": int(thread["id"]),
+                "messageId": int(last["id"]) if last else 0,
+                "characterId": cid,
+                "role": role, "scene": scene[:80],
+                "emotion": "；".join(emo), "action": action}
+
+    # 提示词分段：顺序固定，备注永远最前（核心约束）
+    CG_SEGMENTS = (("note", "备注·核心约束", "手动填写 · 权重最高"),
+                   ("role", "角色外观", "角色卡 description"),
+                   ("scene", "场景", "作品简介"),
+                   ("emotion", "情绪", "状态面板 + 档位规则"),
+                   ("action", "动作/状态", "最近回复 + 状态面板"))
+
+    def _chat_cg_segments(self, fields: dict) -> tuple:
+        segs = []
+        for key, label, source in Handler.CG_SEGMENTS:
+            text = re.sub(r"\s+", " ", str(fields.get(key) or "")).strip()
+            if text:
+                segs.append({"key": key, "label": label,
+                             "source": source, "text": text})
+        prompt = "\n".join(f"【{s['label']}】{s['text']}" for s in segs)
+        return segs, prompt
+
+    def _chat_cg(self, uid, payload: dict) -> bool:
+        """POST /chatSession/aiCg：聊天页 AI 生成 CG。
+
+        dryRun=true 只回拼装结果（字段预填 + prompt 预览），不生成、不扣分。
+        """
+        if not uid:
+            return self._local_ok({"ok": False, "error": "请先登录后再生成 CG"},
+                                  "ai-cg-login")
+        sid = str(payload.get("sessionId") or payload.get("threadId") or "")
+        base_info = self._chat_cg_defaults(uid, sid)
+        if not base_info:
+            return self._local_ok({"ok": False, "error": "会话不存在"}, "ai-cg-nosid")
+
+        base, key, model, provider_name, local = self._image_endpoint_info()
+        bill = db.image_charge(1, local=local)
+        balance = db.points_balance(uid)
+        can_afford = bill["total"] <= 0 or balance >= bill["total"]
+        auto = {k: base_info[k] for k in ("role", "scene", "emotion", "action")}
+
+        if payload.get("dryRun"):
+            # 预览：用前端已编辑的字段，空段回落自动取值
+            fields = {}
+            for k in ("note", "role", "scene", "emotion", "action"):
+                fields[k] = str(payload.get(k) or "").strip() or auto.get(k, "")
+            segs, prompt = self._chat_cg_segments(fields)
+            return self._local_ok({
+                "ok": True, "defaults": {"note": "", **auto},
+                "fields": fields, "segments": segs, "prompt": prompt,
+                "cost": bill["total"], "balance": balance, "canAfford": can_afford,
+                "local": local, "providerName": provider_name,
+                "messageId": base_info["messageId"],
+            }, "ai-cg-preview")
+
+        fields = {}
+        for k in ("note", "role", "scene", "emotion", "action"):
+            fields[k] = str(payload.get(k) or "").strip()
+        if not fields["note"]:
+            return self._local_ok({"ok": False, "error": "请填写备注（核心约束）"},
+                                  "ai-cg-nonote")
+        fields = {k: (v or auto.get(k, "")) for k, v in fields.items()}
+        segs, prompt = self._chat_cg_segments(fields)
+        if not can_afford:
+            return self._local_ok({
+                "ok": False,
+                "error": f"积分不足：本次需要 {bill['total']} 积分，当前余额 {balance}",
+                "need": bill["total"], "balance": balance}, "ai-cg-points")
+
+        # 默认 1:1 1K 走数据库尺寸表解析，不再在代码里硬编码像素映射
+        size_row, size_err = db.image_size_lookup("1024x1024")
+        if not size_row:
+            return self._local_ok({"ok": False, "error": size_err}, "ai-cg-size")
+        try:
+            if local:
+                data = imagegen.placeholder_png(
+                    prompt, size_row["tier"], 0, width=int(size_row["width"]),
+                    height=int(size_row["height"]))
+            else:
+                data = imagegen.generate(
+                    base, key, model, prompt, "", n=1,
+                    size=size_row["tier"], ratio=size_row["ratio"],
+                    width=int(size_row["width"]), height=int(size_row["height"]),
+                    tier=size_row["tier"])[0]
+        except Exception as exc:                     # noqa: BLE001
+            db.db_log("CHAT_CG_FAIL", "chat_cg",
+                      json.dumps({"model": model, "error": str(exc)[:300]},
+                                 ensure_ascii=False), uid)
+            return self._local_ok({"ok": False, "error": f"生成失败：{exc}"},
+                                  "ai-cg-fail")
+
+        out = self._cg_save_image(
+            uid, base_info["characterId"] or sid, data,
+            f"ai_cg_{time.strftime('%Y%m%d_%H%M%S')}"
+            f"{imagegen.detect_ext(data)}", "image/png", "", source="ai")
+        cg_msg_id = int(payload.get("messageId") or base_info["messageId"] or 0)
+        # 关联表存相对路径，回包时再按当前 Host 补全（换端口/域名也不会挂错）
+        rel_url = urlparse(out["url"]).path or out["url"]
+        db.chat_cg_add(uid, base_info["threadId"], cg_msg_id,
+                       out["id"], rel_url, out["imageName"], prompt)
+        points = min(bill["total"], balance)
+        if points > 0:
+            db.add_points(uid, -points)
+            db.log_consumption(uid, "image", "", prompt[:60], "image", 0, points)
+        out.update({"ok": True, "prompt": prompt, "segments": segs,
+                    "model": model, "providerName": provider_name, "local": local,
+                    "pointsDeducted": points, "balance": db.points_balance(uid),
+                    "messageId": cg_msg_id, "threadId": base_info["threadId"]})
+        db.db_log("CHAT_CG_GENERATE", "chat_cg",
+                  json.dumps({"model": model, "local": local, "points": points},
+                             ensure_ascii=False), uid)
+        return self._local_ok(out, "ai-cg-generate")
+
     def _local_chat(self, rel: str, params: dict, payload: dict,
                     uid: int | None) -> bool:
         if rel == "narratium/guestChat/chatStream":
@@ -4857,6 +5161,9 @@ class Handler(BaseHTTPRequestHandler):
         if not rel.startswith("narratium/chatSession/"):
             return False
         sub = rel.split("/", 2)[2]
+
+        if sub == "aiCg":
+            return self._chat_cg(uid, payload)
 
         if sub == "list":
             cid = str(payload.get("characterId") or payload.get("characterID") or "")
@@ -4914,6 +5221,25 @@ class Handler(BaseHTTPRequestHandler):
                 m["status"] = r["status"]
                 m["statusValues"] = status_dict(r["status"])
                 m["options"] = r["options"]
+            # 回填聊天里 AI 生成的 CG，刷新后仍挂在对应回复下方
+            msgs = data.get("messages") or []
+            if msgs:
+                real_sid = str(msgs[0].get("sessionId") or sid)
+                thr = db.one("SELECT id FROM chat_threads WHERE user_id IS ?"
+                             " AND session_id=?", (uid, real_sid))
+                if thr:
+                    cg_map = db.chat_cg_for_messages(
+                        int(thr["id"]), [m.get("id") for m in msgs])
+                    if cg_map:
+                        host = self.headers.get("Host") or "127.0.0.1:4173"
+                        for items in cg_map.values():
+                            for it in items:
+                                it["url"] = f"http://{host}{it['url']}"
+                                it["imageURL"] = it["url"]
+                        for m in msgs:
+                            got = cg_map.get(self._int(m.get("id"), 0))
+                            if got:
+                                m["cgImages"] = got
             return self._local_ok(data, self._note or "chat-messages")
 
         if sub == "messages":                     # 老接口名，和上面同义
@@ -5782,6 +6108,9 @@ class Handler(BaseHTTPRequestHandler):
         if sub == "upload":
             return self._local_cg_upload(uid, bcid(self._json_body()))
         payload = self._json_body()
+        if sub == "aiGenerate" and self.command == "POST":
+            # AI 生成：备注为主提示词，标签辅助，生成后原地替换该条 CG
+            return self._local_cg_ai_generate(uid, bcid(payload), payload)
         if sub == "import" and self.command == "POST":
             # 导入：用 JSON 里的 images 整体覆盖该角色的 CG（字段做白名单与取值兜底）
             ch = bcid(payload)
@@ -5987,6 +6316,7 @@ class Handler(BaseHTTPRequestHandler):
             data = b""
             fname = "cg.png"
             mime = "image/png"
+            replace_id = ""  # 编辑弹窗里"替换 CG 图片"传进来的原图 id
             for part in raw.split(boundary):
                 part = part.strip(b"\r\n")
                 if not part or part.startswith(b"--"):
@@ -6002,6 +6332,11 @@ class Handler(BaseHTTPRequestHandler):
                     if cid:
                         characterId = cid
                     continue
+                # 文本字段：replaceId（编辑弹窗替换图片时，原地替换这条 CG）
+                if re.search(r'name="replaceId"', head_txt) and \
+                        not re.search(r'filename=', head_txt):
+                    replace_id = payload.strip().decode("utf-8", "replace")
+                    continue
                 # 文件字段
                 fm = re.search(r'filename="([^"]*)"', head_txt)
                 if not fm:
@@ -6015,33 +6350,227 @@ class Handler(BaseHTTPRequestHandler):
                 return self._local_ok({"ok": False, "error": "no file"}, "cg-upload-nofile")
             if len(data) > 0xa00000:
                 return self._local_ok({"ok": False, "error": "超过10MB"}, "cg-upload-size")
-            ckey = f"cg:images:{uid or 0}:{characterId}"
-            import uuid
-            ext = os.path.splitext(fname)[1].lower() or ".png"
-            fname_local = "cg_" + uuid.uuid4().hex[:12] + ext
-            dest = IMAGE_DIR / fname_local
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(data)
-            imagedb.register("/image/" + fname_local, dest, "upload")
-            obj = {"id": fname_local, "imageId": fname_local,
-                   "url": "/image/" + fname_local, "imageURL": "/image/" + fname_local,
-                   "imageName": fname, "mimeType": mime,
-                   "source": "user", "isActive": True, "isPublic": False,
-                   "keywords": [], "characterTags": [], "sceneTags": [],
-                   "emotionTags": [], "actionTags": [], "description": "",
-                   "imageSize": len(data), "displayDuration": 0, "position": "center",
-                   "triggerOnce": False, "triggerSource": ["ai"], "scanDepth": 1}
-            images = db.get_config_list(ckey)
-            images.append(obj)
-            db.set_config(ckey, images)
-            # 存库保持相对路径；返回前端时补全 host，方便"复制图片链接"直接用
-            host = self.headers.get("Host") or "127.0.0.1:4173"
-            out = dict(obj)
-            out["url"] = f"http://{host}{obj['url']}"
-            out["imageURL"] = f"http://{host}{obj['imageURL']}"
-            return self._local_ok(out, "cg-upload")
+            return self._local_ok(
+                self._cg_save_image(uid, characterId, data, fname, mime, replace_id),
+                "cg-replace" if replace_id else "cg-upload")
         except Exception as exc:  # noqa: BLE001
             return self._local_ok({"ok": False, "error": str(exc)}, "cg-upload-err")
+
+    def _cg_save_image(self, uid, characterId: str, data: bytes, display_name: str,
+                       mime: str, replace_id: str = "",
+                       source: str = "upload") -> dict:
+        """图片落 html/image + image.db，并写入该角色的 CG 列表。
+
+        传 replace_id 时原地替换那条 CG（保留 id / 标签 / 触发配置，删旧文件）；
+        否则追加一条新 CG。返回值补全 host，供前端直接预览与复制链接。
+        """
+        import uuid
+        ckey = f"cg:images:{uid or 0}:{characterId}"
+        ext = os.path.splitext(display_name)[1].lower() or ".png"
+        fname_local = "cg_" + uuid.uuid4().hex[:12] + ext
+        dest = IMAGE_DIR / fname_local
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        imagedb.register("/image/" + fname_local, dest, source)
+        obj = {"id": fname_local, "imageId": fname_local,
+               "url": "/image/" + fname_local, "imageURL": "/image/" + fname_local,
+               "imageName": display_name, "mimeType": mime,
+               "source": "user" if source == "upload" else "ai",
+               "isActive": True, "isPublic": False,
+               "keywords": [], "characterTags": [], "sceneTags": [],
+               "emotionTags": [], "actionTags": [], "description": "",
+               "imageSize": len(data), "displayDuration": 0, "position": "center",
+               "triggerOnce": False, "triggerSource": ["ai"], "scanDepth": 1}
+        images = db.get_config_list(ckey)
+        host = self.headers.get("Host") or "127.0.0.1:4173"
+
+        def _abs(d):
+            d = dict(d)
+            d["url"] = f"http://{host}{d['url']}"
+            d["imageURL"] = f"http://{host}{d['imageURL']}"
+            return d
+
+        if replace_id:
+            target = None
+            for x in images:
+                if str(x.get("id") or x.get("imageId") or "") == replace_id:
+                    target = x
+                    break
+            if target is not None:
+                old_files = set()
+                for k in ("url", "imageURL", "imageUrl"):
+                    p = target.get(k)
+                    if isinstance(p, str) and p:
+                        name = os.path.basename(urlparse(p).path)
+                        if name:
+                            old_files.add(name)
+                for name in old_files - {fname_local}:
+                    try:
+                        stale = IMAGE_DIR / name
+                        if stale.exists():
+                            stale.unlink()
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[cg] 旧图清理失败 {name}: {exc}")
+                for k in ("url", "imageURL", "imageName", "mimeType", "imageSize"):
+                    target[k] = obj[k]
+                if "imageUrl" in target:  # 兼容旧条目的驼峰字段
+                    target["imageUrl"] = obj["url"]
+                db.set_config(ckey, images)
+                out = _abs(target)
+                out["replaceId"] = replace_id
+                return out
+            # 目标已不存在（别处删掉了）→ 退化成新增
+        images.append(obj)
+        db.set_config(ckey, images)
+        return _abs(obj)
+
+    # AI 生成 CG 的提示词分段：备注固定第一段（核心约束），其余按标签补充
+    CG_AI_SEGMENTS = (("characterTags", "角色", "角色标签"),
+                      ("sceneTags", "场景", "场景标签"),
+                      ("emotionTags", "情绪", "情绪标签"),
+                      ("actionTags", "动作/状态", "动作标签"))
+
+    @staticmethod
+    def _cg_ai_tags(payload: dict, field: str) -> list:
+        v = payload.get(field)
+        if isinstance(v, str):
+            v = re.split(r"[,，]", v)
+        if not isinstance(v, list):
+            return []
+        return [str(x).strip() for x in v if str(x).strip()]
+
+    def _cg_ai_compose(self, desc: str, payload: dict) -> tuple:
+        """拼提示词：备注最前（核心约束），角色→场景→情绪→动作补在后。
+
+        备注为空时不占位，直接按剩余要素降级拼装；标题只给标签段，
+        备注保持自然语言，避免模型把标签当画面文字。
+        """
+        segs = []
+        if desc:
+            segs.append({"key": "note", "label": "备注（核心约束）",
+                         "source": "手动填写", "text": desc})
+        for field, label, source in Handler.CG_AI_SEGMENTS:
+            vals = Handler._cg_ai_tags(payload, field)
+            if vals:
+                segs.append({"key": field, "label": label, "source": source,
+                             "text": "、".join(vals)})
+        lines = [s["text"] if s["key"] == "note" else f"{s['label']}：{s['text']}"
+                 for s in segs]
+        return segs, "\n".join(lines).strip()
+
+    @staticmethod
+    def _image_error_text(exc: Exception) -> str:
+        """把绘图上游报错翻成看得懂的中文（401/超时/地址错/网络不通分开说）。"""
+        text = str(exc)
+        low = text.lower()
+        if ("http 401" in low or "unauthorized" in low
+                or "invalid api key" in low or "invalid_api_key" in low):
+            return ("绘图服务鉴权失败（401）：API Key 无效或已过期，"
+                    "请到控制台「模型接入 → 绘图」重新填写")
+        if "http 403" in low:
+            return "绘图服务拒绝访问（403）：请检查 API Key 权限或账户额度"
+        if "http 404" in low:
+            return "绘图接口地址不正确（404）：请检查绘图接入的 API 地址"
+        if "超时" in text or "timeout" in low or "timed out" in low:
+            return "绘图服务请求超时：请稍后重试"
+        if "连不上" in text or "connection refused" in low:
+            return "连不上绘图服务：请检查网络与绘图接入地址"
+        return "绘图服务报错：" + text[:200]
+
+    def _local_cg_ai_generate(self, uid, characterId: str, payload: dict) -> bool:
+        """POST /cg/aiGenerate：以备注为主提示词、标签为辅，调绘图模型生成一张 CG。
+
+        dryRun=true 只回拼装结果（提示词预览 + 费用/余额），不生成、不扣分；
+        正式生成可用 payload["prompt"] 提交用户在预览里改过的完整提示词。
+        传 replaceId 则原地替换该条 CG（保留备注 / 标签 / 触发配置），否则追加。
+        """
+        if not characterId:
+            return self._local_ok({"ok": False, "error": "缺少 characterId"}, "cg-ai-nocid")
+
+        if not db.active_image_endpoint():
+            return self._local_ok({
+                "ok": False,
+                "error": ("未配置绘图模型：请先在控制台「模型接入 → 绘图」里"
+                          "添加并启用一个绘图接入"),
+                "code": "no_model"}, "cg-ai-nomodel")
+
+        desc = str(payload.get("description") or "").strip()
+        segs, prompt = self._cg_ai_compose(desc, payload)
+        dry_run = bool(payload.get("dryRun"))
+        if dry_run:
+            # 预览阶段允许直接用前端拼好的草稿（用于回显编辑后的内容）
+            prompt = str(payload.get("prompt") or prompt).strip()
+        else:
+            override = str(payload.get("prompt") or "").strip()
+            if override:
+                prompt = override
+        if not prompt:
+            return self._local_ok({
+                "ok": False, "error": "备注和标签都为空，先填一项再生成"}, "cg-ai-noprompt")
+
+        base, key, model, provider_name, local = self._image_endpoint_info()
+        bill = db.image_charge(1, local=local)
+        balance = db.points_balance(uid or 0)
+        can_afford = bill["total"] <= 0 or balance >= bill["total"]
+
+        if dry_run:
+            return self._local_ok({
+                "ok": True, "prompt": prompt, "segments": segs,
+                "cost": bill["total"], "balance": balance,
+                "canAfford": can_afford, "local": local,
+                "providerName": provider_name, "model": model,
+            }, "cg-ai-preview")
+
+        if not can_afford:
+            return self._local_ok({
+                "ok": False,
+                "error": (f"积分不足：本次需要 {bill['total']} 积分，"
+                          f"当前余额 {balance}"),
+                "code": "no_points",
+                "need": bill["total"], "balance": balance}, "cg-ai-points")
+
+        size_row, size_err = db.image_size_lookup("1024x1024")
+        if not size_row:
+            return self._local_ok({"ok": False, "error": size_err,
+                                   "code": "size_invalid"}, "cg-ai-size")
+        try:
+            if local:
+                data = imagegen.placeholder_png(
+                    prompt, size_row["tier"], 0, width=int(size_row["width"]),
+                    height=int(size_row["height"]))
+            else:
+                data = imagegen.generate(
+                    base, key, model, prompt, "", n=1,
+                    size=size_row["tier"], ratio=size_row["ratio"],
+                    width=int(size_row["width"]), height=int(size_row["height"]),
+                    tier=size_row["tier"])[0]
+        except imagegen.ImageGenError as exc:
+            db.db_log("CG_AI_GENERATE_FAIL", "cg_images",
+                      json.dumps({"model": model, "error": str(exc)[:300]},
+                                 ensure_ascii=False), uid)
+            return self._local_ok({
+                "ok": False, "error": Handler._image_error_text(exc),
+                "code": "upstream"}, "cg-ai-fail")
+
+        out = self._cg_save_image(
+            uid, characterId, data,
+            f"ai_cg_{time.strftime('%Y%m%d_%H%M%S')}.{imagegen.detect_ext(data).lstrip('.')}",
+            "image/png", str(payload.get("replaceId") or ""), source="ai")
+        out["prompt"] = prompt
+        out["segments"] = segs
+        out["model"] = model
+        out["providerName"] = provider_name
+        out["local"] = local
+        points = min(bill["total"], balance) if uid else 0
+        if points > 0:
+            db.add_points(uid, -points)
+            db.log_consumption(uid, "image", "", prompt[:60], "image", 0, points)
+        out["pointsDeducted"] = points
+        out["balance"] = db.points_balance(uid or 0)
+        db.db_log("CG_AI_GENERATE", "cg_images",
+                  json.dumps({"model": model, "local": local, "points": points},
+                             ensure_ascii=False), uid)
+        return self._local_ok(out, "cg-ai-generate")
 
     def route(self) -> None:
         parsed = urlparse(self.path)
@@ -6050,12 +6579,12 @@ class Handler(BaseHTTPRequestHandler):
 
         # 分段依次尝试，任一段处理完即返回 True；全部未命中 → 兜底反代线上。
         # 段顺序有先后依赖（管理员接口在静态资源前、账号会话在业务接口前）：
-        #   控制台 → 聊天配套接口 → 管理员 API → 新前端页面 → 旧路径跳转 →
-        #   静态资源 → 媒体文件 → 账号会话 → 业务 API → 反代兜底
+        #   控制台 → 聊天配套接口 → 管理员 API → 新前端页面 → 根级页面 →
+        #   旧路径跳转 → 静态资源 → 媒体文件 → 账号会话 → 业务 API → 反代兜底
         for seg in (self._route_console, self._route_chat_api,
                     self._route_admin_api, self._route_app_pages,
-                    self._route_legacy_redirects, self._route_static,
-                    self._route_media, self._route_auth,
+                    self._route_root_pages, self._route_legacy_redirects,
+                    self._route_static, self._route_media, self._route_auth,
                     self._route_business_api):
             if seg(path, query):
                 return
@@ -6071,14 +6600,10 @@ class Handler(BaseHTTPRequestHandler):
 
     # --- 1. 本地控制台：页面 + 控制台登录（仅管理员可见） ---
     def _route_console(self, path: str, query: str) -> bool:
-        if path in ("/local", "/local/"):
-            if self.admin_session():
-                self.send_file(HTML_DIR / "console.html")
-            else:
-                self.send_console_login()
-            return True
-        if path in ("/local/login", "/local/login/"):
-            self._redirect("/local/")
+        if path in ("/local", "/local/", "/local/login", "/local/login/"):
+            # 控制台页面已合并到自建页 /app/console（原 html/console.html 已删除）；
+            # 旧地址保留 302，书签与站点侧栏入口不失效，管理员校验由 /app/console 负责。
+            self._redirect("/app/console")
             return True
         if path == "/local/api/login" and self.command == "POST":
             self.handle_console_login()
@@ -6150,13 +6675,14 @@ class Handler(BaseHTTPRequestHandler):
         self.handle_local_api(path, query)
         return True
 
-    # --- 4. 新自建前端：/app/* 页面与共享资源、/creation-guide 教程页 ---
+    # --- 4. 新自建前端：/app/<name> 统一分发到 html/app/<name>.html ---
     def _route_app_pages(self, path: str, query: str) -> bool:
         if path in ("/app", "/app/"):
             self._redirect("/app/explore")
             return True
         if path.startswith("/app/"):
-            rel = path[len("/app/"):].strip("/")
+            rel = path[len("/app/"):]
+            # 页面依赖的静态子目录（/app/css、/app/js、/app/img、/app/assets）仍走 safe 校验
             if rel.startswith(("css/", "js/", "img/", "assets/")):
                 f = safe(APP_DIR, rel)
                 if f:
@@ -6164,22 +6690,50 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self.not_found()
                 return True
-            page = rel.split("/")[0]
-            if page == "console" and not self.admin_session():
+            name = rel[:-1] if rel.endswith("/") else rel
+            if not name:
+                self.not_found()
+                return True
+            if name.endswith(".html"):
+                # /app/chat.html → 302 /app/chat，统一到无扩展名形式
+                base = name[:-5]
+                if page_target(APP_DIR, base) is not None:
+                    self._redirect("/app/" + base + ("?" + query if query else ""))
+                    return True
+                self.not_found()
+                return True
+            f = page_target(APP_DIR, name)
+            if "/" in name or f is None:
+                self.not_found()
+                return True
+            if name == "console" and not self.admin_session():
                 # 控制台与 /local/api/* 一样只给管理员：未登录先出管理员登录页
                 self.send_console_login()
                 return True
-            if page in APP_PAGES:
-                f = APP_DIR / (page + ".html")
-                if f.is_file():
-                    self.send_file(f)
-                    return True
-            self.not_found()
+            self.send_file(f)
             return True
         if path == "/creation-guide" or path.startswith("/creation-guide/"):
             self._redirect("/app/creation-guide")
             return True
         return False
+
+    # --- 4b. 根级页面：/<name> → html/<name>.html（文件存在才分发，否则交给后续段） ---
+    def _route_root_pages(self, path: str, query: str) -> bool:
+        name = path[:-1] if path.endswith("/") else path[1:]
+        if not name or "/" in name or name in ROOT_PAGE_RESERVED:
+            return False
+        if name.endswith(".html"):
+            # /foo.html → 302 /foo（仅当 html/foo.html 确实存在）
+            base = name[:-5]
+            if base in ROOT_PAGE_RESERVED or page_target(HTML_DIR, base) is None:
+                return False
+            self._redirect("/" + base + ("?" + query if query else ""))
+            return True
+        f = page_target(HTML_DIR, name)
+        if f is None:
+            return False
+        self.send_file(f)
+        return True
 
     # --- 5. 旧镜像页路径（页面已删除）→ 302 到新自建页，老书签不失效 ---
     def _route_legacy_redirects(self, path: str, query: str) -> bool:
@@ -6218,20 +6772,13 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     # --- 6. 静态资源：前端脚本 / 样式 / 字体 / 根目录固定文件 ---
+    # 只保留 /app/js/*、/app/css/* 一套路径（由 _route_app_pages 分发）；
+    # 历史的 /js/*、/css/* 已下线，按未知路径 404，不再提供别名。
     def _route_static(self, path: str, query: str) -> bool:
-        if path.startswith("/js/"):
-            f = safe(JS_DIR, path[4:])
-            if f:
-                self.send_file(f)
-                return True
-        if path.startswith("/css/"):
-            rel = path[5:]
-            if self._css_from_db(path, rel):
-                return True
-            f = safe(CSS_DIR, rel)
-            if f:
-                self.send_file(f)
-                return True
+        if path.startswith(("/js/", "/css/")):
+            # 历史路径已下线：明确 404，避免落到反代回源拿到线上同名文件
+            self.not_found()
+            return True
         if path.startswith("/html/assets/"):
             f = safe(HTML_DIR, "assets/" + path[len("/html/assets/"):])
             if f:
@@ -6704,6 +7251,11 @@ class ChatTurnRunner:
             turn = ChatRouter(self._ports()).chat_stream(self._request())
         except Exception as exc:                     # noqa: BLE001
             # 生成链路异常：清掉本轮 user 消息，避免下一轮连续两条 user
+            # 同时把堆栈打到 stderr：此前这里只回错误帧、不落日志，无法定位
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            print(f"[chat] 生成链路异常：{type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
             self._delete_user()
             h._sse_frame({"type": "error", "message": f"生成失败：{exc}"})
             h._sse_frame({"type": "done", "assistantMessageId": 0,
@@ -6904,7 +7456,7 @@ CLIENT_PATCHES = (
 
 
 def patch_client_js() -> None:
-    """给 html/js 下的产物打补丁（幂等）：内容没变就不写盘，重启多少次都安全。"""
+    """给 html/app/js 下的产物打补丁（幂等）：内容没变就不写盘，重启多少次都安全。"""
     for js in JS_DIR.rglob("*.js"):
         try:
             text = js.read_bytes().decode("utf-8")

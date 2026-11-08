@@ -3,9 +3,7 @@
 mirror.py — 抓取 https://missai01.com 首页到本地（构建工具，只需运行一次）
 
 输出：
-    html/          index.html（原样页面）+ assets/（图片、字体、图标）
-    js/            全部脚本
-    css/           全部样式
+    html/          index.html（原样页面）+ assets/（图片、字体、图标）+ app/js、app/css
 
 用法： python mirror.py
 """
@@ -23,8 +21,8 @@ from urllib.parse import urljoin
 ORIGIN = "https://missai01.com"
 ROOT = Path(__file__).resolve().parent.parent   # 项目根（本脚本在 tools/ 下）
 HTML_DIR = ROOT / "html"
-JS_DIR = HTML_DIR / "js"
-CSS_DIR = HTML_DIR / "css"
+JS_DIR = HTML_DIR / "app" / "js"
+CSS_DIR = HTML_DIR / "app" / "css"
 ASSET_DIR = HTML_DIR / "assets"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -148,8 +146,8 @@ def main() -> None:
 
     print("\n完成。目录：")
     print("  html/   index.html + assets/(图片、字体)")
-    print("  js/     全部脚本")
-    print("  css/    全部样式")
+    print("  app/js/ 全部脚本")
+    print("  app/css/ 全部样式")
     print("\n下一步： python server.py  然后访问 http://localhost:4173/home")
 
 
@@ -312,8 +310,9 @@ PAGE_CAP = 3
 
 
 def _mirror_assets() -> int:
-    """样式入库：把站点 css（html/css/*.css）存进 mirror_assets 表。
-    两种访问路径（/css/ 与 /_next/static/css/）都登记，服务器出样式时从库回。"""
+    """样式归档：把站点 css（html/app/css/*.css）存进 mirror_assets 表。
+    只按线上的 /_next/static/css/ 原始 URL 登记；服务端不再从这张表出样式，
+    对外样式统一走 /app/css/*。"""
     n = 0
     if CSS_DIR.is_dir():
         for p in sorted(CSS_DIR.glob("*.css")):
@@ -321,8 +320,7 @@ def _mirror_assets() -> int:
                 data = p.read_bytes()
             except OSError:
                 continue
-            for alias in ("/css/" + p.name, "/_next/static/css/" + p.name):
-                db.asset_save(alias, data)
+            db.asset_save("/_next/static/css/" + p.name, data)
             n += 1
     return n
 

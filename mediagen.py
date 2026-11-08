@@ -396,6 +396,12 @@ def build_prompt(recipe: dict, fields: dict) -> str:
 def pick_size(recipe: dict, fields: dict) -> str:
     conf = _local_conf(recipe)
     ratio = str(fields.get("aspectRatio") or "").strip()
+    tier = str(conf.get("tier") or "1K").strip().upper()
+    # 模板比例 → 数据库尺寸表里的官方像素（避免旧 sizeByRatio 把 3:4 映射成 2:3）
+    if ratio:
+        row, _err = db.image_size_lookup(ratio=ratio, tier=tier)
+        if row:
+            return str(row["pixels"])
     table = conf.get("sizeByRatio") if isinstance(conf.get("sizeByRatio"), dict) else {}
     return str(table.get(ratio) or conf.get("size") or "1024x1024")
 
@@ -534,14 +540,25 @@ def _run(gid: str, recipe: dict, author: str) -> None:
         endpoint = define_endpoint(recipe)
         db.media_generation_set(gid, status="running", model=endpoint.get("model") or "")
         n = max(1, min(4, int(conf.get("count") or 1)))
+        # 任务里存的是旧像素值 → 先反查数据库尺寸表，查不到明确报错（不静默换尺寸）
+        size_row, size_err = db.image_size_lookup(str(row["size"] or ""))
+        if not size_row:
+            raise imagegen.ImageGenError(size_err)
+        if size_row["pixels"] != row["size"]:
+            db.media_generation_set(gid, size=size_row["pixels"])
         if endpoint.get("local"):
-            images = [imagegen.placeholder_png(row["prompt"], row["size"],
-                                              int(row["seed"] or 0)) for _ in range(n)]
+            images = [imagegen.placeholder_png(
+                row["prompt"], size_row["tier"], int(row["seed"] or 0),
+                width=int(size_row["width"]), height=int(size_row["height"]))
+                for _ in range(n)]
         else:
-            images = imagegen.generate(endpoint.get("base") or "", endpoint.get("key") or "",
-                                       endpoint.get("model") or "", row["prompt"],
-                                       row["negative"] or "", row["size"] or "1024x1024",
-                                       n, seed=int(row["seed"] or 0))
+            images = imagegen.generate(
+                endpoint.get("base") or "", endpoint.get("key") or "",
+                endpoint.get("model") or "", row["prompt"],
+                row["negative"] or "", n=n, seed=int(row["seed"] or 0),
+                size=size_row["tier"], ratio=size_row["ratio"],
+                width=int(size_row["width"]), height=int(size_row["height"]),
+                tier=size_row["tier"])
         if not images:
             raise imagegen.ImageGenError("上游没有返回可用的图片数据")
 

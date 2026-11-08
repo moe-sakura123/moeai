@@ -22,6 +22,7 @@ db.py — 本地 SQLite 数据层（纯标准库 sqlite3）
 
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -221,6 +222,40 @@ def _migrate_chat_memories(conn: sqlite3.Connection) -> int:
                 pass
         n += 1
     return n
+
+
+# Agnes 官方「输出尺寸参考」：8 比例 × 4 档位，初始只写一次
+IMAGE_SIZE_SEED = [
+    ('1:1', '1K', 1024, 1024), ('1:1', '2K', 2048, 2048),
+    ('1:1', '3K', 3072, 3072), ('1:1', '4K', 4096, 4096),
+    ('3:4', '1K', 864, 1152), ('3:4', '2K', 1728, 2304),
+    ('3:4', '3K', 2592, 3456), ('3:4', '4K', 3456, 4608),
+    ('4:3', '1K', 1152, 864), ('4:3', '2K', 2304, 1728),
+    ('4:3', '3K', 3456, 2592), ('4:3', '4K', 4608, 3456),
+    ('16:9', '1K', 1312, 736), ('16:9', '2K', 2624, 1472),
+    ('16:9', '3K', 3936, 2208), ('16:9', '4K', 5248, 2944),
+    ('9:16', '1K', 736, 1312), ('9:16', '2K', 1472, 2624),
+    ('9:16', '3K', 2208, 3936), ('9:16', '4K', 2944, 5248),
+    ('2:3', '1K', 832, 1248), ('2:3', '2K', 1664, 2496),
+    ('2:3', '3K', 2496, 3744), ('2:3', '4K', 3328, 4992),
+    ('3:2', '1K', 1248, 832), ('3:2', '2K', 2496, 1664),
+    ('3:2', '3K', 3744, 2496), ('3:2', '4K', 4992, 3328),
+    ('21:9', '1K', 1568, 672), ('21:9', '2K', 3136, 1344),
+    ('21:9', '3K', 4704, 2016), ('21:9', '4K', 6272, 2688),
+]
+IMAGE_SIZE_RATIOS = ['1:1', '3:4', '4:3', '16:9', '9:16', '2:3', '3:2', '21:9']
+IMAGE_SIZE_TIERS = ['1K', '2K', '3K', '4K']
+
+
+def _seed_image_sizes(conn: sqlite3.Connection) -> None:
+    """幂等写入官方 32 条尺寸；已有记录（用户改过值）不覆盖。"""
+    now = now_iso()
+    for i, (ratio, tier, width, height) in enumerate(IMAGE_SIZE_SEED):
+        conn.execute(
+            "INSERT INTO image_sizes(ratio, tier, width, height, points, enabled,"
+            " sort, created_at, updated_at) VALUES(?,?,?,?,0,1,?,?,?)"
+            " ON CONFLICT(ratio, tier) DO NOTHING",
+            (ratio, tier, int(width), int(height), i, now, now))
 
 
 def init() -> None:
@@ -501,6 +536,20 @@ def init() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_mem_recall
             ON chat_memory_recall_log(user_id, session_id, id DESC);
+        -- 聊天页"AI 生成 CG"的落库关联：刷新后按 message_id 把图挂回对应 AI 回复
+        CREATE TABLE IF NOT EXISTS chat_cg_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER,
+            thread_id   INTEGER NOT NULL,
+            message_id  INTEGER NOT NULL DEFAULT 0,
+            cg_id       TEXT NOT NULL DEFAULT '',
+            url         TEXT NOT NULL DEFAULT '',
+            image_name  TEXT NOT NULL DEFAULT '',
+            prompt      TEXT NOT NULL DEFAULT '',
+            created_at  TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_cg_msg
+            ON chat_cg_log(thread_id, message_id);
 
         -- 发给 LLM 的完整 prompt 快照（每次 chatStream 调用前落盘，用于调试/复现/审计）
         CREATE TABLE IF NOT EXISTS chat_prompt_log (
@@ -845,6 +894,29 @@ def init() -> None:
         CREATE INDEX IF NOT EXISTS idx_image_works_created ON image_works(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_image_works_likes ON image_works(likes DESC);
 
+        -- 绘图输出尺寸：Agnes 官方「比例 × 档位」→ 精确像素。
+        -- 前端只传 ratio + tier，后端按本表解析宽高，不再硬编码映射。
+        -- points 为单张积分，0 表示沿用全局 pointsPerImage。
+        CREATE TABLE IF NOT EXISTS image_sizes (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            ratio      TEXT NOT NULL,
+            tier       TEXT NOT NULL,
+            width      INTEGER NOT NULL,
+            height     INTEGER NOT NULL,
+            points     INTEGER NOT NULL DEFAULT 0,
+            enabled    INTEGER NOT NULL DEFAULT 1,
+            sort       INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(ratio, tier)
+        );
+        CREATE INDEX IF NOT EXISTS idx_image_sizes_sort
+            ON image_sizes(sort, id);
+        CREATE INDEX IF NOT EXISTS idx_image_sizes_enabled
+            ON image_sizes(enabled, tier, ratio);
+        CREATE INDEX IF NOT EXISTS idx_image_sizes_pixels
+            ON image_sizes(width, height);
+
         -- 绘图模板生成任务（/api/gva/aiMedia/creator/recipes/<key>/generations）
         -- 源站这套接口是「提交 → 轮询」，这里用一张表存任务状态，
         -- 生成完把图片登记进 image_works，前端拿到 assetUrl 就算成功
@@ -996,6 +1068,9 @@ def init() -> None:
                 (int(r["memory_id"]), len(vals),
                  struct.pack(f"{len(vals)}f", *[x / norm for x in vals])))
         conn.execute("DROP TABLE chat_memory_vectors_old")
+
+    # 官方输出尺寸表：幂等补齐 32 条，已有记录不覆盖
+    _seed_image_sizes(conn)
 
     # 创作页配置种子：筛选项与模型列表（线上没登录时也够用）
     now = now_iso()
@@ -1494,12 +1569,22 @@ def charge_chat(user_id: int | None, prompt_text: str, reply_text: str = "",
             "ok": deducted >= quote["cost"]}
 
 
-def image_charge(count: int = 1, local: bool = False) -> dict:
-    """生图计费：按张数 × 单张积分；本地占位绘图可配置免费"""
+def image_charge(count: int = 1, local: bool = False, points=None) -> dict:
+    """生图计费：按张数 × 单张积分；本地占位绘图可配置免费。
+
+    points 来自尺寸表 image_sizes.points（0/None 表示沿用全局 pointsPerImage），
+    这样不同档位可以配置不同单价，面板显示与实扣都以此为准。
+    """
     img = get_rules().get("image") or {}
-    per = 0 if (local and img.get("freeLocal", True)) else int(img.get("pointsPerImage") or 0)
+    free_local = bool(img.get("freeLocal", True))
+    if local and free_local:
+        per = 0
+    elif points is not None and int(points or 0) > 0:
+        per = int(points)
+    else:
+        per = int(img.get("pointsPerImage") or 0)
     total = per * max(0, int(count))
-    return {"perImage": per, "total": total}
+    return {"perImage": per, "total": total, "freeLocal": free_local}
 
 
 def log_consumption(user_id, kind: str, target_id="", target_name="", mode="points",
@@ -2641,7 +2726,7 @@ def content_fallback(url_key: str, path: str, qs: str = "") -> dict | None:
     return {"code": 0, "msg": "本地内容库", "data": data, "local": True}
 
 
-# --------------------------------------------------------------- 静态资源入库（html/css 从数据库调用）
+# --------------------------------------------------------------- 静态资源入库（html/app/css 从数据库调用）
 # mirror.py 的 "assets" 数据面把站点样式抓进这张表；服务器出 css 时先查库，命中就从库回。
 ASSETS_TABLE = "mirror_assets"
 
@@ -4669,11 +4754,18 @@ def set_image_active(pid, model: str = "") -> dict | None:
 
 
 def image_rate_models() -> list[dict]:
-    """绘图页「选择模型」：所有接入里检测到的模型 + 本地占位兜底"""
+    """绘图页「选择模型」：所有接入里检测到的模型 + 本地占位。
+
+    sizes 旧字段一律用数据库里的官方像素清单（不再信任接入配置里的 sizes）；
+    真正给前端做选择的是 /gallery/models 返回的 sizeOptions（ratio + tier）。
+    """
+    pixels = image_size_pixel_list(enabled_only=True)
     items = []
     for row in query("SELECT * FROM image_providers WHERE enabled=1"
                      " ORDER BY is_default DESC, id ASC"):
         models = [m for m in _as_list(row["models"]) if isinstance(m, dict)]
+        base = str(row["base_url"] or "")
+        official = "agnes" in base.lower()
         for m in models:
             mid = str(m.get("model") or "")
             if not mid:
@@ -4683,20 +4775,34 @@ def image_rate_models() -> list[dict]:
                 "modelID": mid, "modelId": mid, "modelName": mid,
                 "description": row["name"], "providerName": row["name"],
                 "providerId": int(row["id"]), "providerKind": row["kind"],
-                "sizes": [str(s) for s in _as_list(row["sizes"]) if str(s).strip()],
+                "providerBase": base,
+                "sizes": list(pixels),
                 "isDefault": bool(int(row["is_default"] or 0))
                 and str(row["default_model"] or "") == mid,
                 "price": 0, "currency": "points", "isEnabled": True,
+                "capabilities": {
+                    "ratio": True, "tier": True, "n": True,
+                    # 官方 payload 只认 size 档位 + ratio；seed 仅本地占位真正生效
+                    "seed": False,
+                    # 上游没有 negative 字段：后端把排除语义并入 prompt，仍会生效
+                    "negative": True, "negativeViaPrompt": True,
+                    "official": official,
+                },
             })
-    if not items:
-        items.append({
-            "ID": LOCAL_IMAGE_RATE_ID, "id": LOCAL_IMAGE_RATE_ID,
-            "modelID": LOCAL_IMAGE_MODEL_ID, "modelId": LOCAL_IMAGE_MODEL_ID,
-            "modelName": "本地占位绘图", "description": "未接绘图模型时可用（不联网）",
-            "providerName": "本地", "providerId": 0, "providerKind": "local",
-            "sizes": ["1024x1024", "1024x1536", "1536x1024", "512x512"],
-            "isDefault": True, "price": 0, "currency": "points", "isEnabled": True,
-        })
+    items.append({
+        "ID": LOCAL_IMAGE_RATE_ID, "id": LOCAL_IMAGE_RATE_ID,
+        "modelID": LOCAL_IMAGE_MODEL_ID, "modelId": LOCAL_IMAGE_MODEL_ID,
+        "modelName": "本地占位绘图", "description": "不联网，可用种子生成占位图",
+        "providerName": "本地", "providerId": 0, "providerKind": "local",
+        "providerBase": "local://placeholder",
+        "sizes": list(pixels),
+        "isDefault": not items, "price": 0, "currency": "points", "isEnabled": True,
+        "capabilities": {
+            "ratio": True, "tier": True, "n": True,
+            "seed": True, "negative": False, "negativeViaPrompt": False,
+            "official": False,
+        },
+    })
     return items
 
 
@@ -4888,6 +4994,204 @@ def video_rate_models() -> list[dict]:
                 "price": 0, "currency": "points", "isEnabled": True,
             })
     return items
+
+
+# --------------------------------------------------------------- 绘图尺寸
+
+def image_size_rows(enabled_only: bool = False) -> list[dict]:
+    """输出尺寸表：按 sort/id 排序；enabled_only=True 只回启用项。"""
+    where = " WHERE enabled=1" if enabled_only else ""
+    return query("SELECT id, ratio, tier, width, height, points, enabled, sort"
+                 " FROM image_sizes" + where + " ORDER BY sort ASC, id ASC")
+
+
+def _image_size_ratio_value(text: str) -> float:
+    try:
+        a, b = str(text or "").split(":", 1)
+        return float(a) / float(b) if float(b) else 0.0
+    except (ValueError, TypeError, ZeroDivisionError):
+        return 0.0
+
+
+def _image_size_nearest_tier(ratio: str, width: int, height: int) -> str:
+    """旧像素 → 该比例下最接近的档位（按总像素对数距离）。
+
+    不能用短边一刀切：2:3 4K 短边 3328、4:3 4K 短边 3456，都会被误判成 3K。
+    """
+    rows = query("SELECT tier, width, height FROM image_sizes WHERE ratio=?",
+                 (str(ratio),))
+    if not rows:
+        return "1K"
+    target = math.log(max(1, int(width) * int(height)))
+    best, best_gap = "1K", None
+    for r in rows:
+        gap = abs(math.log(max(1, int(r["width"]) * int(r["height"]))) - target)
+        if best_gap is None or gap < best_gap:
+            best, best_gap = str(r["tier"]), gap
+    return best
+
+
+def _image_size_find(ratio: str, tier: str) -> tuple[dict | None, str]:
+    row = one("SELECT id, ratio, tier, width, height, points, enabled, sort"
+              " FROM image_sizes WHERE ratio=? AND tier=?",
+              (str(ratio), str(tier)))
+    if not row:
+        return None, "尺寸组合 %s %s 不存在，请重新选择" % (tier, ratio)
+    row = dict(row)
+    row["pixels"] = "%dx%d" % (int(row["width"]), int(row["height"]))
+    if not int(row.get("enabled") or 0):
+        return None, "尺寸组合 %s %s 已禁用，请重新选择" % (tier, ratio)
+    return row, ""
+
+
+def image_size_lookup(size="", ratio="", tier="") -> tuple[dict | None, str]:
+    """按「比例 + 档位」或「像素」解析尺寸。
+
+    比例+档位是官方语义；像素写法用于兼容旧调用：先精确匹配宽高，
+    再按像素比例反查官方组合（比例误差需 <=1.5%）。查不到直接报错，
+    不会静默替换成别的尺寸。
+    """
+    size_text = str(size or "").strip()
+    ratio_text = str(ratio or "").strip()
+    tier_text = str(tier or "").strip().upper()
+
+    if ratio_text:
+        if tier_text not in IMAGE_SIZE_TIERS:
+            m = re.match(r"^(\d+)\s*[x×]\s*(\d+)$", size_text, re.I)
+            if m:
+                tier_text = _image_size_nearest_tier(
+                    ratio_text, int(m.group(1)), int(m.group(2)))
+            elif size_text.upper() in IMAGE_SIZE_TIERS:
+                tier_text = size_text.upper()
+            else:
+                tier_text = "1K"
+        return _image_size_find(ratio_text, tier_text)
+
+    if not size_text:
+        return None, "缺少尺寸参数（比例 + 档位或像素）"
+
+    # 像素精确匹配（含已禁用项，禁用要给明确提示）
+    m = re.match(r"^(\d+)\s*[x×]\s*(\d+)$", size_text, re.I)
+    if m:
+        w, h = int(m.group(1)), int(m.group(2))
+        row = one("SELECT id, ratio, tier, width, height, points, enabled, sort"
+                  " FROM image_sizes WHERE width=? AND height=?", (w, h))
+        if row:
+            row = dict(row)
+            row["pixels"] = "%dx%d" % (int(row["width"]), int(row["height"]))
+            if not int(row.get("enabled") or 0):
+                return None, "尺寸 %dx%d 已禁用，请重新选择" % (w, h)
+            return row, ""
+        # 旧数据兼容：按宽高比反查官方组合
+        target = (w / h) if h else 0.0
+        hit_ratio = ""
+        for r in IMAGE_SIZE_RATIOS:
+            if abs(_image_size_ratio_value(r) - target) <= 0.015:
+                hit_ratio = r
+                break
+        if hit_ratio:
+            return _image_size_find(hit_ratio,
+                                    _image_size_nearest_tier(hit_ratio, w, h))
+        return None, "像素 %dx%d 无法反查到官方尺寸组合，请改用比例 + 档位" % (w, h)
+
+    if size_text.upper() in IMAGE_SIZE_TIERS:
+        return _image_size_find("1:1", size_text.upper())
+
+    return None, "无法识别尺寸「%s」，请改用比例 + 档位" % size_text
+
+
+CUSTOM_SIZE_MIN = 64          # 小于 64px 的边没有实际意义，上游也会放大
+CUSTOM_SIZE_MAX = 8192        # 官方 4K 最长边 6272，8192 留出余量
+CUSTOM_SIZE_MAX_PIXELS = 20_000_000   # 官方 4K 最大 16.86M 像素，20M 内不会异常
+
+
+def image_size_custom(width, height) -> tuple[dict | None, str]:
+    """自定义宽高（不写库）。
+
+    1) 先按宽高精确匹配 image_sizes 已有组合（命中即视为官方尺寸，不归一化）；
+    2) 匹配不到时按最接近的官方比例 + 档位归一化，并回传 requestedPixels /
+       actualPixels / normalized，避免静默替换。
+    """
+    try:
+        w, h = int(width), int(height)
+    except (TypeError, ValueError):
+        return None, "自定义宽高必须是整数（收到 %r / %r）" % (width, height)
+    if not (CUSTOM_SIZE_MIN <= w <= CUSTOM_SIZE_MAX and CUSTOM_SIZE_MIN <= h <= CUSTOM_SIZE_MAX):
+        return None, ("自定义宽高需在 %d–%d px 之间（当前 %dx%d）"
+                      % (CUSTOM_SIZE_MIN, CUSTOM_SIZE_MAX, w, h))
+    if w * h > CUSTOM_SIZE_MAX_PIXELS:
+        return None, ("自定义尺寸像素总量过大（上限 %d 万，当前 %dx%d）"
+                      % (CUSTOM_SIZE_MAX_PIXELS // 10000, w, h))
+
+    rows = image_size_rows()
+    requested = "%dx%d" % (w, h)
+    exact = next((r for r in rows if int(r["width"]) == w and int(r["height"]) == h), None)
+    if exact:
+        if not int(exact.get("enabled") or 0):
+            return None, "尺寸 %dx%d 已禁用，请重新选择" % (w, h)
+        row = dict(exact)
+        row["pixels"] = requested
+        row.update(requestedPixels=requested, actualPixels=requested,
+                   normalized=False, aspectDeviation=0.0, aspectWarning=False)
+        return row, ""
+
+    enabled = [r for r in rows if int(r.get("enabled") or 0)]
+    if not enabled:
+        return None, "尺寸表里没有启用的记录，请先在控制台启用官方尺寸"
+    ratios = []
+    for r in enabled:
+        if str(r["ratio"]) not in ratios:
+            ratios.append(str(r["ratio"]))
+    target = (w / h) if h else 0.0
+    best_ratio, best_gap = "", None
+    for r in ratios:
+        gap = abs(math.log(target / _image_size_ratio_value(r))) if target else 0.0
+        if best_gap is None or gap < best_gap:
+            best_ratio, best_gap = r, gap
+    tier = _image_size_nearest_tier(best_ratio, w, h)
+    found = next((r for r in enabled
+                  if str(r["ratio"]) == best_ratio and str(r["tier"]) == str(tier)), None)
+    if not found:
+        return None, "无法为 %s 找到可用的官方尺寸组合，请改用比例 + 档位" % requested
+    row = dict(found)
+    row["pixels"] = "%dx%d" % (int(row["width"]), int(row["height"]))
+    row.update(
+        requestedPixels=requested, actualPixels=row["pixels"], normalized=True,
+        aspectDeviation=round(math.exp(best_gap) - 1, 4) if best_gap else 0.0,
+        aspectWarning=bool(best_gap and best_gap > math.log(1.15)),
+    )
+    return row, ""
+
+
+def _image_size_option(row: dict) -> dict:
+    width, height = int(row["width"]), int(row["height"])
+    return {
+        "id": int(row["id"]), "ratio": str(row["ratio"]), "tier": str(row["tier"]),
+        "width": width, "height": height, "pixels": "%dx%d" % (width, height),
+        "points": int(row.get("points") or 0),
+        "enabled": bool(int(row.get("enabled") or 0)),
+        "sort": int(row.get("sort") or 0),
+    }
+
+
+def image_size_table() -> dict:
+    """对外的尺寸清单：比例/档位/精确像素/积分/启用状态，全部由数据库驱动。"""
+    options = [_image_size_option(r) for r in image_size_rows()]
+    ratios, tiers = [], []
+    for opt in options:
+        if opt["ratio"] not in ratios:
+            ratios.append(opt["ratio"])
+        if opt["tier"] not in tiers:
+            tiers.append(opt["tier"])
+    return {"sizeOptions": options, "sizeSource": "db:image_sizes",
+            "ratios": ratios or list(IMAGE_SIZE_RATIOS),
+            "tiers": tiers or list(IMAGE_SIZE_TIERS)}
+
+
+def image_size_pixel_list(enabled_only: bool = True) -> list[str]:
+    """官方像素清单（旧字段 sizes 兼容用；以数据库表为准）。"""
+    return ["%dx%d" % (int(r["width"]), int(r["height"]))
+            for r in image_size_rows(enabled_only)]
 
 
 # --------------------------------------------------------------- 绘图作品（绘图广场）
@@ -7657,4 +7961,37 @@ def _purge_memory_items(where: str, args) -> None:
         execute("DELETE FROM chat_memory_vectors WHERE memory_id=?", (mid,))
         _fts_delete(mid)
     execute("DELETE FROM chat_memory_items WHERE " + where, args)
+
+
+# ---------------------------------------------------------------- 聊天 CG 关联
+def chat_cg_add(user_id, thread_id: int, message_id: int, cg_id: str,
+                url: str, image_name: str, prompt: str) -> int:
+    """记录一条聊天里 AI 生成的 CG，刷新后按消息 id 挂回。"""
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO chat_cg_log (user_id, thread_id, message_id, cg_id, url,"
+        " image_name, prompt, created_at) VALUES (?,?,?,?,?,?,?,?)",
+        (user_id, int(thread_id), int(message_id or 0), cg_id, url,
+         image_name, prompt, now_iso()))
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def chat_cg_for_messages(thread_id: int, message_ids) -> dict:
+    """返回 {message_id: [cg, ...]}，消息接口据此回填 cgImages。"""
+    ids = [int(x) for x in (message_ids or []) if str(x).isdigit()]
+    if not ids:
+        return {}
+    marks = ",".join("?" * len(ids))
+    rows = query(
+        "SELECT * FROM chat_cg_log WHERE thread_id=? AND message_id IN ("
+        + marks + ") ORDER BY id ASC", tuple([int(thread_id)] + ids))
+    out: dict = {}
+    for r in rows:
+        out.setdefault(int(r["message_id"]), []).append({
+            "id": r["cg_id"], "cgId": r["cg_id"],
+            "url": r["url"], "imageURL": r["url"],
+            "imageName": r["image_name"], "prompt": r["prompt"],
+        })
+    return out
 

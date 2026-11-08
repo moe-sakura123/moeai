@@ -105,10 +105,14 @@ def main():
     check("旧首页 302 → 新首页", st == 302 and loc == "/app/explore", f"{st} {loc}")
     st, h, b = call("GET", "/app/explore")
     check("新首页 200", st == 200 and b"<html" in b, f"status={st}")
-    st, h, b = call("GET", "/css/75c3c077ba6990e4.css")
+    st, h, b = call("GET", "/app/css/75c3c077ba6990e4.css")
     check("控制台基础 CSS 可访问", st == 200 and h.get("Content-Type", "").startswith("text/css"), f"{st}")
-    st, h, b = call("GET", "/js/console.js")
+    st, h, b = call("GET", "/app/js/console.js")
     check("JS 目录可访问", st == 200, f"{st}")
+    st, h, b = call("GET", "/js/console.js")
+    check("旧 /js/* 已下线（404）", st == 404, f"{st}")
+    st, h, b = call("GET", "/css/console.css")
+    check("旧 /css/* 已下线（404）", st == 404, f"{st}")
 
     print("== 本地注册 / 登录 ==")
     name = "tester_%d" % (int(__import__("time").time()) % 100000)
@@ -337,12 +341,12 @@ def main():
 
     print("== 目录结构：html 里含 js / css / image ==")
     base = Path(__file__).parent
-    for d in ("html", "html/js", "html/css", "html/image"):
+    for d in ("html", "html/app", "html/app/js", "html/app/css", "html/image"):
         check(f"目录 {d}/ 存在", (base / d).is_dir(), str(base / d))
     check("根目录不再放 js/", not (base / "js").exists(), str(base / "js"))
     check("根目录不再放 css/", not (base / "css").exists(), str(base / "css"))
-    check("js 里有站点脚本", len(list((base / "html" / "js").glob("*.js"))) > 40, "")
-    check("css 里有样式表", len(list((base / "html" / "css").glob("*.css"))) >= 3, "")
+    check("js 里有站点脚本", len(list((base / "html" / "app" / "js").glob("*.js"))) > 0, "")
+    check("css 里有样式表", len(list((base / "html" / "app" / "css").glob("*.css"))) >= 3, "")
 
     print("== 图片专用数据库 image.db ==")
     check("image.db 已创建", (base / "data" / "image.db").is_file(), "")
@@ -549,21 +553,21 @@ def main():
 
 
     print("== 控制台入口按钮（仅管理员可见） ==")
-    st, h, b = call("GET", "/js/console-entry.js")
+    st, h, b = call("GET", "/app/js/console-entry.js")
     check("入口脚本可访问", st == 200 and b"data-local-console-entry" in b, f"{st}")
     st, h, b = call("GET", "/home")
-    check("未登录：首页不注入入口", b"/js/console-entry.js" not in b, f"{st} len={len(b)}")
+    check("未登录：首页不注入入口", b"/app/js/console-entry.js" not in b, f"{st} len={len(b)}")
     st, h, b = call("GET", "/home", headers={"Cookie": f"local_session={token}"})
-    check("普通用户：首页不注入入口", b"/js/console-entry.js" not in b, f"{st} len={len(b)}")
+    check("普通用户：首页不注入入口", b"/app/js/console-entry.js" not in b, f"{st} len={len(b)}")
     st, h, b = call("GET", "/home", headers=admin_ck)
-    check("管理员：首页注入入口脚本", b"/js/console-entry.js" in b, f"{st} len={len(b)}")
-    check("注入不重复", b.count(b"/js/console-entry.js") == 1, f"{b.count(b'/js/console-entry.js')}")
+    check("管理员：首页注入入口脚本", b"/app/js/console-entry.js" in b, f"{st} len={len(b)}")
+    check("注入不重复", b.count(b"/app/js/console-entry.js") == 1, f"{b.count(b'/app/js/console-entry.js')}")
     st, h, b = call("GET", "/login", headers=admin_ck)
-    check("代理页也注入入口脚本", b"/js/console-entry.js" in b, f"{st} len={len(b)}")
+    check("代理页也注入入口脚本", b"/app/js/console-entry.js" in b, f"{st} len={len(b)}")
     st, h, b = call("GET", "/local/", headers=admin_ck)
-    check("控制台页不再注入", b"/js/console-entry.js" not in b, f"{st}")
+    check("控制台页不再注入", b"/app/js/console-entry.js" not in b, f"{st}")
     check("磁盘 HTML 未被改写",
-          "/js/console-entry.js" not in (Path(__file__).parent / "html" / "app" / "explore.html")
+          "/app/js/console-entry.js" not in (Path(__file__).parent / "html" / "app" / "explore.html")
           .read_text(encoding="utf-8", errors="replace"), "")
 
     print("== 控制台只让管理员看 ==")

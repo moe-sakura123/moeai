@@ -13,6 +13,7 @@ base_url 填官方 https://api.openai.com/v1，或任何兼容这套协议的中
 """
 
 import json
+import os
 import random
 import sys
 import threading
@@ -23,16 +24,21 @@ import httpx
 
 UA = "missai-local/1.0"
 
-# 超时三段：连接 10s（含连接池等待 pool）/ 首字节 30s（流式 60s）/ 空闲 120s。
+# 超时三段：连接 3s（含连接池等待 pool）/ 首字节 30s（流式 60s）/ 空闲 120s。
 # httpx 的 read 是"单次读"超时：请求发出时先用首字节阈值（覆盖握手后等响应头），
 # 拿到响应头后把同一次请求的 read 改成空闲阈值，再用 watchdog 兜住"第一帧"上限。
-CONNECT_TIMEOUT = 10.0
+# 连接阶段单独收紧：不可达地址/坏链路快速失败，不把首字节预算耗在拨号上。
+CONNECT_TIMEOUT = 3.0
+POOL_TIMEOUT = 3.0
+WRITE_TIMEOUT = 10.0
 FIRST_BYTE_TIMEOUT = 30.0
 FIRST_BYTE_TIMEOUT_STREAM = 60.0
 IDLE_TIMEOUT = 120.0
 
-# 重试：总尝试 4 次，等待 1/2/4 秒 + 0~25% 抖动；Retry-After 封顶 30s。
+# 重试：总尝试 4 次；连接建立阶段失败最多尝试 2 次（WriteTimeout 仍按 4 次）。
+# 等待 1/2/4 秒 + 0~25% 抖动；Retry-After 封顶 30s。
 MAX_ATTEMPTS = 4
+CONNECT_MAX_ATTEMPTS = 2
 RETRYABLE_STATUS = (408, 409, 425, 429)
 RETRY_AFTER_CAP = 30.0
 
@@ -83,7 +89,8 @@ class LLMError(RuntimeError):
     """
 
     def __init__(self, message, status: int = 0, code: str = "",
-                 retryable: bool | None = None, retry_after: float = 0.0):
+                 retryable: bool | None = None, retry_after: float = 0.0,
+                 connect_failed: bool = False):
         super().__init__(message)
         self.status = int(status or 0)
         self.code = str(code or "")
@@ -91,6 +98,8 @@ class LLMError(RuntimeError):
             retryable = self.status >= 500 or self.status in RETRYABLE_STATUS
         self.retryable = bool(retryable)
         self.retry_after = max(0.0, float(retry_after or 0.0))
+        # 仅标记"连接建立阶段"的失败，用于单独压低重试次数；不影响原有分类
+        self.connect_failed = bool(connect_failed)
 
 
 def _retry_after_seconds(headers) -> float:
@@ -149,11 +158,27 @@ def _notify_sent(on_send, url: str, payload, stream: bool) -> None:
 
 # 同步客户端：连接池 / 重定向 / 环境代理 / TLS / gzip 解压都交给 httpx。
 # read 默认不设，由每次请求按"首字节 → 空闲"两段自己改。
+#
+# IPv4 优先：本机网络存在 IPv6 黑洞，系统解析会把上游的 AAAA 记录排在 A 记录之前，
+# httpx 逐个地址拨号会白等多个 connect 超时。显式绑定 IPv4 源地址后，AF_INET6
+# 候选会立即失败并被跳过，只走 IPv4。
+# 注意：httpx 在显式传 transport 时会关闭环境代理（allow_env_proxies=False），
+# 所以检测到 HTTP(S)_PROXY 等配置时保留默认链路，并打印一条降级说明。
+_PROXY_ENV_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                   "http_proxy", "https_proxy", "all_proxy")
+_PROXY_CONFIGURED = any(os.environ.get(k) for k in _PROXY_ENV_KEYS)
+_TRANSPORT = None
+if _PROXY_CONFIGURED:
+    print("[llm] 检测到环境代理配置，跳过 IPv4 强制，沿用 httpx 默认代理链路",
+          file=sys.stderr, flush=True)
+else:
+    _TRANSPORT = httpx.HTTPTransport(local_address="0.0.0.0")
 _CLIENT = httpx.Client(
+    transport=_TRANSPORT,
     follow_redirects=True,
     trust_env=True,
     timeout=httpx.Timeout(connect=CONNECT_TIMEOUT, read=None,
-                          write=CONNECT_TIMEOUT, pool=CONNECT_TIMEOUT),
+                          write=WRITE_TIMEOUT, pool=POOL_TIMEOUT),
 )
 
 
@@ -209,7 +234,7 @@ def _build_request(method: str, url: str, api_key: str, data, accept: str,
     return _CLIENT.build_request(
         method, url, headers=headers, content=data,
         timeout=httpx.Timeout(connect=CONNECT_TIMEOUT, read=float(first_timeout),
-                              write=CONNECT_TIMEOUT, pool=CONNECT_TIMEOUT))
+                              write=WRITE_TIMEOUT, pool=POOL_TIMEOUT))
 
 
 def _switch_idle(request: httpx.Request) -> None:
@@ -225,17 +250,18 @@ def _remaining_first(started: float, first_timeout: float) -> float:
 
 def _send_error(exc: Exception, url: str) -> LLMError:
     if isinstance(exc, httpx.PoolTimeout):
-        return LLMError(f"连接池等待超时（{CONNECT_TIMEOUT:.0f}s）：{url}",
-                        code="timeout", retryable=True)
+        return LLMError(f"连接池等待超时（{POOL_TIMEOUT:.0f}s）：{url}",
+                        code="timeout", retryable=True, connect_failed=True)
     if isinstance(exc, httpx.ConnectTimeout):
         return LLMError(f"连接超时（{CONNECT_TIMEOUT:.0f}s）：{url}",
-                        code="timeout", retryable=True)
+                        code="timeout", retryable=True, connect_failed=True)
     if isinstance(exc, httpx.WriteTimeout):
-        return LLMError(f"发送超时（{CONNECT_TIMEOUT:.0f}s）：{url}",
+        return LLMError(f"发送超时（{WRITE_TIMEOUT:.0f}s）：{url}",
                         code="timeout", retryable=True)
     if isinstance(exc, httpx.TimeoutException):
         return LLMError(f"请求超时：{url}", code="timeout", retryable=True)
-    return LLMError(f"连不上 {url}：{exc}", code="network", retryable=True)
+    return LLMError(f"连不上 {url}：{exc}", code="network", retryable=True,
+                    connect_failed=True)
 
 
 def _read_body(resp: httpx.Response, request: httpx.Request,
@@ -764,7 +790,8 @@ def chat_stream(base_url: str, api_key: str, model: str, messages: list[dict],
                 include_usage: bool = False, **extra):
     """流式对话：逐段 yield 文本增量。
 
-    还没吐出任何内容时按状态码重试（总尝试 MAX_ATTEMPTS 次，1/2/4s + 抖动，
+    还没吐出任何内容时按状态码重试（非连接建立类失败总尝试 MAX_ATTEMPTS 次，
+    连接建立阶段失败只尝试 CONNECT_MAX_ATTEMPTS 次；等待 1/2/4s + 抖动，
     Retry-After 封顶 30s，401/403/400 不重试）；地址没写 /v1 且 404 时先补一次 /v1。
     一旦吐出第一段就不再换地址或重试——客户端已经收到半截内容，
     已下发内容的回滚由上层处理。
@@ -786,6 +813,7 @@ def chat_stream(base_url: str, api_key: str, model: str, messages: list[dict],
         urls.append(f"{base}/v1/chat/completions")
     url_idx = 0
     attempt = 1
+    connect_failures = 0
     empty_retried = False
     strip_done: set[str] = set()          # 已摘过的参数组（每组只重试一次）
     while True:
@@ -812,6 +840,10 @@ def chat_stream(base_url: str, api_key: str, model: str, messages: list[dict],
                     print(f"[llm] 上游拒绝参数，摘掉 {desc} 后重试：{exc}",
                           file=sys.stderr, flush=True)
                     continue          # 不占网络重试次数，但每组只摘一次
+            if exc.connect_failed:
+                connect_failures += 1      # 只对连接建立阶段单独计数
+                if connect_failures >= CONNECT_MAX_ATTEMPTS:
+                    raise
             if attempt >= MAX_ATTEMPTS:
                 raise
             retry_ok = exc.retryable
