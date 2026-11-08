@@ -1,15 +1,15 @@
 /* 本地控制台入口 —— 由服务端注入到站点页面里
  *
- * 在原站左侧导航栏末尾加一条「控制台」按钮，指向 /local/。
+ * 在原站左侧导航栏末尾加一条「控制台」按钮，指向 /app/console。
  * 页面 HTML 保持原样（不改磁盘文件），只在回包时插一个 script；
  * React 重新渲染会把外来节点清掉，所以用 MutationObserver 持续补回。
  */
 (function () {
-  "use strict";
+  'use strict';
 
   var MARK = "data-local-console-entry";
   var LABEL = "控制台";
-  var HREF = "/local/";
+  var HREF = "/app/console";
   var ICON = '<rect width="7" height="9" x="3" y="3" rx="1"></rect>' +
              '<rect width="7" height="5" x="14" y="3" rx="1"></rect>' +
              '<rect width="7" height="9" x="14" y="12" rx="1"></rect>' +

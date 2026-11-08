@@ -1237,11 +1237,15 @@ td.path {
   .status-grid { grid-template-columns: 1fr 1fr; }
   .conn-card { grid-column: 1 / -1; }
   .explorer { grid-template-columns: 220px minmax(0, 1fr); }
+  #view-creation .cards { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
 }
 
 @media (max-width: 900px) {
   .topbar { flex-wrap: wrap; gap: 10px; }
   .topnav { order: 3; width: 100%; overflow-x: auto; flex-wrap: nowrap; padding-bottom: 2px; }
+  /* 内联样式给 .console-header .topnav 设了 flex-end：内容超宽时会把左侧页签
+     推到负坐标，scrollLeft 永远到不了。手机端用更高优先级改为左对齐，14 个页签都能滑到。 */
+  body .console-header .topnav { justify-content: flex-start; }
   .back-home { margin-left: auto; }
   .explorer { grid-template-columns: 1fr; }
   .table-list {
@@ -1253,6 +1257,10 @@ td.path {
   .table-item { min-width: 155px; flex: 1 1 155px; }
   .connect-form { grid-template-columns: 1fr 1fr; }
   .connect-form .span2 { grid-column: 1 / -1; }
+  /* 窄屏触控目标 40px；镜像控件允许换行，避免长选项把胶囊撑出 hero */
+  .topnav button, main#main .btn, .pager button { min-height: 40px; }
+  main#main input:not([type="checkbox"]), main#main select, .pager select { min-height: 40px; }
+  .mirror-controls { flex-wrap: wrap; }
 }
 
 @media (max-width: 640px) {
@@ -1270,6 +1278,14 @@ td.path {
   .col-row .check { justify-content: flex-start; }
   .site-foot { padding: 20px 16px 34px; }
   .toast { right: 16px; left: 16px; bottom: 16px; max-width: none; }
+  /* 控制台头部与内容留白（原 console.html 内联 768 规则并入此处） */
+  .console-header { justify-content: flex-start; padding: 10px 14px; }
+  main#main { padding: 16px 14px 36px; }
+  /* 镜像控件长选项在手机宽度下换行到第二行，不再被 hero 的 overflow:hidden 裁掉 */
+  .hero-actions { width: 100%; }
+  .mirror-controls { max-width: 100%; justify-content: center; padding: 6px; border-radius: 16px; }
+  .mirror-controls .mirror-surface { max-width: 100%; min-width: 0; }
+  .mirror-limit { width: 64px; }
 }
 
 /* ---------------------------------------------------------- 绘图模型：模板接入 */
@@ -1320,9 +1336,6 @@ td.path {
 
 /* ---------------------------------------------------------- 控制台：创作数据（作品 + 世界书） */
 #view-creation .cards { grid-template-columns: repeat(5, minmax(0, 1fr)); }
-@media (max-width: 1180px) {
-  #view-creation .cards { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
-}
 #view-creation .panel { overflow-x: auto; }
 #view-creation table { min-width: 940px; }
 #view-creation .nowrap { white-space: nowrap; }

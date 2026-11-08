@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark">
   <title>控制台 · 蜜丝AI</title>
   <link rel="stylesheet" href="/app/css/app.css">
-  <link rel="stylesheet" href="/css/console.css">
+  <link rel="stylesheet" href="/app/css/console.css">
   <style>
     .console-header {
       display: flex; align-items: center; justify-content: space-between;
@@ -20,10 +20,6 @@
     .console-head p { margin: 2px 0 0; font-size: 11px; color: var(--muted); }
     .console-header .topnav { flex: 1 1 auto; justify-content: flex-end; }
     main#main { max-width: none; margin: 0; padding: 22px 26px 44px; }
-    @media (max-width: 768px) {
-      .console-header { justify-content: flex-start; padding: 10px 14px; }
-      main#main { padding: 16px 14px 36px; }
-    }
   </style>
 </head>
 <body>
@@ -86,7 +82,7 @@
 <script src="/app/js/core/api.js"></script>
 <script src="/app/js/core/store.js"></script>
 <script src="/app/js/core/ui.js"></script>
-<script src="/js/console.js?v=20261102a"></script>
+<script src="/app/js/console.js?v=20261102a"></script>
 <script>
   App.ui.mountTopbar('console');
 </script>
